@@ -21,7 +21,6 @@ signal.signal(signal.SIGINT, handler)
 signal.signal(signal.SIGTERM, handler)
 logger = logging.getLogger('ND2.search')
 
-
 def main(args):
     # %% Load Data & Init Model
     data = json.load(open(args.data, 'r'))
@@ -29,7 +28,6 @@ def main(args):
         data[k] = np.array(v)
     data['A'] = data['A'].astype(int)
     data['G'] = data['G'].astype(int) # G = np.stack(np.nonzero(A), axis=-1) can be obtained from A
-
     # init Rewarder
     rewarder = RewardSolver(
         Xv={var: data[var] for var in args.vars},
@@ -39,7 +37,7 @@ def main(args):
         Y=data[args.target_var],
         mask=None,
     )
-    
+
     # init NDformer
     ndformer = NDformer(device=args.device)
     ndformer.load(args.ndformer_path, weights_only=False)
@@ -101,7 +99,8 @@ if __name__ == '__main__':
     parser.add_argument('--data', type=str, default='./data/synthetic/KUR.json')
     parser.add_argument('--info_level', choices=['debug', 'info', 'note', 'warning', 'error', 'critical'], default='info')
     parser.add_argument('--ndformer_path', type=str, default='./weights/checkpoint.pth')
-    parser.add_argument('--vars', type=str, nargs='*', default=['x', 'omega'])
+    # parser.add_argument('--vars', type=str, nargs='*', default=['x', 'omega'])
+    parser.add_argument('--vars', type=str, nargs='*', default=['x', 'y'])
     parser.add_argument('--target_var', type=str, default='dx')
     parser.add_argument('--save_path', type=str, default='./result/search.csv')
     args, unknown = parser.parse_known_args()

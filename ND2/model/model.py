@@ -348,7 +348,6 @@ class NDformer(nn.Module):
         self.eval()
         with torch.no_grad():
             if not hasattr(self, 'var_dict'): raise ValueError('Please call .set_data() first!')
-            
             prefixes = [[self.var_map.get(token, token) for token in prefix] for prefix in prefixes]
 
             if not self.cache_data_emb:

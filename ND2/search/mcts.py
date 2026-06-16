@@ -83,6 +83,7 @@ class MCTS(sklearn.base.BaseEstimator, sklearn.base.RegressorMixin):
         
         self.tabula_rasa = (ndformer is None)
         self.actions = vars_node + vars_edge + binary + unary + constant + ['<C>']
+        # self.actions = vars_node + vars_edge + binary + unary + constant + ['<C>'] + ['<Ce>']
         self.action2idx = {action: idx for idx, action in enumerate(self.actions)}
         self.n_actions = len(self.actions)
 
@@ -124,23 +125,22 @@ class MCTS(sklearn.base.BaseEstimator, sklearn.base.RegressorMixin):
         self.eq_timer.clear()
         seed_all(self.random_state)
 
-        self.expand([root_prefix])
+        self.expand([root_prefix]) # 把初始节点放进树里。
         for episode in range(1, episode_limit+1):
             self.named_timer.add('pre')
 
             # Select
-            routes = self.select(root_prefix)
-            exists_flag = np.array([tuple(route[-1][1]) in self.MC_Tree for route in routes])
-            states_to_expand = [route[-1][1] for route, e in zip(routes, exists_flag) if not e]
+            routes = self.select(root_prefix) # 得到了beam_size()条路径
+            exists_flag = np.array([tuple(route[-1][1]) in self.MC_Tree for route in routes]) #检查路径的末端是否存在于MC_Tree中
+            states_to_expand = [route[-1][1] for route, e in zip(routes, exists_flag) if not e] #如果不存在，就需要扩展MC_Tree
             self.named_timer.add('select')
             
             # Expand
-            self.expand(states_to_expand)
+            self.expand(states_to_expand) # 把需要扩展的状态添加到MC_Tree
             self.named_timer.add('expand')
-            
             # Simulate
             Q = np.full((len(routes),), np.nan)
-            Q[~exists_flag] = self.simulate(states_to_expand)
+            Q[~exists_flag] = self.simulate(states_to_expand) # 通过模拟，计算每个待扩展状态的奖励，奖励越高说明这个状态更好。states_to_expand里面的状态很多不是最终节点（包含占位符），因此需要通过模拟，不断通过策略来选择动作，直到结束，才能计算奖励。
             if np.any(exists_flag):
                 Q[exists_flag] = self.get_rewards([route[-1][1] for route, e in zip(routes, exists_flag) if e])
             if not np.isfinite(Q).all(): 
@@ -149,7 +149,7 @@ class MCTS(sklearn.base.BaseEstimator, sklearn.base.RegressorMixin):
             self.named_timer.add('simulate')
 
             # Backpropagate
-            self.backpropagate(routes, Q)
+            self.backpropagate(routes, Q) # 更新这些路径在MC_Tree中对应状态的Q值和N值
             self.named_timer.add('backpropagate')
 
             self.episode_timer.add(1)
@@ -221,51 +221,67 @@ class MCTS(sklearn.base.BaseEstimator, sklearn.base.RegressorMixin):
         """
         beam_search = [ 
             ([(None, root_prefix)], [], False) # route, UCT_route, Is_leaf_or_terminal
-        ] 
-        while any(not done for _, _, done in beam_search):
+        ] # 一个列表，包含了集束搜索过程中的所有路径 
+        # 每个路径包含：
+        # 列表：存放一条路径，路径上每个节点都是一个元组（动作，状态），起始为（None，‘Node’），表示根节点，此时没有执行动作
+        # 列表：存放这条路径上每个节点的UCT值。
+        # bool值：表示是否结束，如果形成了一个完整公式（终点）那么为False，表示不再扩展。如果是蒙特卡洛搜索树的叶子节点，也为False。其他情况都为True，表示继续扩展
+        while any(not done for _, _, done in beam_search): # 循环，知道集束搜索列表中的所有路径都结束，即所有的路径都找到完整的公式。
             UCT_routes = []
             # calculate UCT for each route
-            for route, UCT_route, done in beam_search:
-                if done:
+            for route, UCT_route, done in beam_search: # 对于集束搜索的每一个路径
+                if done: # 如果这条路径完成了，那么就给UCT_routes中添加这条路径的所有UCT值
                     UCT_routes.append(UCT_route) # shape: [(1,), (1,), ..., (1,)]
-                else:
-                    state = route[-1][1]
-                    mask = self.get_mask(state)
-                    M = np.where(mask, 0., -np.inf)
-                    UCT = self.get_UCT(state) + M
-                    UCT_routes.append([*UCT_route, UCT]) # shape: [(1,), (1,), ..., (1,), (N,)]
+                else: # 如果这条路径没有完成
+                    state = route[-1][1] # 获取这条路径上的最后一个节点的状态。
+                    mask = self.get_mask(state) # 获取这个状态的所有可能动作的索引。0代表不能执行这个动作，1代表可以执行这个动作
+                    M = np.where(mask, 0., -np.inf) # 把为0的mask值赋为负无穷
+                    UCT = self.get_UCT(state) + M # 计算当前状态下所有可能动作的UCT值，不可能的动作计算出来的UCT值为负无穷
+                    # ★ 打印每个合法 token 的概率
+                    Q, N, P = self.MC_Tree[tuple(state)]
+                    if P is not None:
+                        probs = np.where(mask, P, 0.0)
+                        topk = np.argsort(probs)[::-1][:]  # 只打印 top 10
+                        state_str = ' '.join(state[:])  # 只显示前10个token
+                        logger.info(f"[Policy] state=[{state_str}]")
+                        for idx in topk:
+                            if probs[idx] > 0.001:
+                                logger.info(f"  {self.actions[idx]:>10s}: P={probs[idx]:.4f} UCT={UCT[idx]:.4f} Q={Q[idx]:.4f} N={int(N[idx])}")
+                    UCT_routes.append([*UCT_route, UCT]) #构建一个新的列表，存放了路径上所有的UCT的值（L个标量），同时在末尾存放了UCT（一个向量），这个向量的长度是当前状态下一步所有动作的UCT值。也就是说，这个列表同时存了标量和向量，是一个混合列表。
             # find k expanded routes with best mean UCT
-            metric = np.concatenate([sum(UCT_route) / len(UCT_route) for UCT_route in UCT_routes], axis=0)
-            k = min(self.beam_size, np.isfinite(metric).sum())
-            topk_pos = np.argpartition(metric, -k)[-k:]
-            split_pos = np.cumsum([0] + [u[-1].shape[0] for u in UCT_routes])
-            state_id = np.searchsorted(split_pos, topk_pos, side='right') - 1
-            action_id = topk_pos - split_pos[state_id]
+            metric = np.concatenate([sum(UCT_route) / len(UCT_route) for UCT_route in UCT_routes], axis=0) # 对UCT_routes中的每个路径进行求和并且去平均。这一步巧妙的利用了python的广播机制，因为每个UCT_route的最后都是一个向量，前面的标量会扩展到和这个向量相同的维度。这个metric的长度为beam_search中所有路径的下一步动作的数量之和。
+            k = min(self.beam_size, np.isfinite(metric).sum()) # 接下来进行剪枝，如果metric中可执行的动作的数量超过beam_size，那么就只保留beam_size个
+            topk_pos = np.argpartition(metric, -k)[-k:] # metric排名前k的位置列表,这个位置是相对于metric的位置，而不是self.actions中的位置
+            split_pos = np.cumsum([0] + [u[-1].shape[0] for u in UCT_routes]) # 对metric进行分区，因为metric包含了beam_search中所有路径的下一步动作的指标，因此分区的目的是将metric里面的值进行分区，每个区对应一条路径的下一步动作的metric
+            state_id = np.searchsorted(split_pos, topk_pos, side='right') - 1 # 长度为beam_size，每个元素代表这选择的k个动作分别对应着beam_search中的哪条路径。
+            action_id = topk_pos - split_pos[state_id] # 通过metric中的索引(topk_pos)减去分区的索引，得到绝对索引（即self.actions中对应的索引）,现在可以通过这个索引直接获取对应的动作了。
             _beam_search = []
             for idx, action in zip(state_id, action_id):
-                if UCT_routes[idx][-1].shape[0] == 1: 
-                    _beam_search.append(beam_search[idx])
-                else:
-                    route = beam_search[idx][0]
-                    state = self.act(route[-1][1], self.actions[action])
-                    UCT_route = [*UCT_routes[idx][:-1], UCT_routes[idx][-1][action:action+1]]
-                    done = (tuple(state) not in self.MC_Tree) or (not self.get_mask(state).any())
+                if UCT_routes[idx][-1].shape[0] == 1: #如果当前路径最后一个节点的下一步动作的数量是1
+                    _beam_search.append(beam_search[idx]) #那么保留这条路径。
+                else: #如果当前路径最后一个节点不止一个下一步动作
+                    route = beam_search[idx][0] # 获取当前路径的（动作，状态）列表
+                    state = self.act(route[-1][1], self.actions[action]) # 在当前这条路径末端的状态下，执行这个动作，得到新的状态
+                    UCT_route = [*UCT_routes[idx][:-1], UCT_routes[idx][-1][action:action+1]] # 更新这条路径的UCT值（在末端加入执行的这个动作对应的UCT值）
+                    done = (tuple(state) not in self.MC_Tree) or (not self.get_mask(state).any()) # 如果这个新状态在MC_Tree不存在或者这个新状态后面不会有新的动作了（结束），那么这条路径标记为完成
                     _beam_search.append(([*route, (self.actions[action], state)], UCT_route, done))
-            beam_search = _beam_search
+            beam_search = _beam_search # 更新beam_search，进行下一次循环
         routes = [route for route, _, _ in beam_search]
-        return routes
+        return routes # 返回beam_search中的所有路径（动作，状态）列表
 
     def expand(self, states_to_expand:List[List[str]]):
         """
         Arguments:
-        - states_to_expand: List[List[str]], length = M
+        - states_to_expand: List[List[str]], length = M，存放所有需要expand的节点的状态
             M states to expand
         """
         if not self.tabula_rasa: policies = self.get_policy(states_to_expand)[0]
+        # policies是一个列表，对应每个状态的策略。每个策略的长度等于动作的数量，每个值代表执行该动作的概率
         else:                    policies = [None for _ in states_to_expand]
         for state, policy in zip(states_to_expand, policies):
             assert tuple(state) not in self.MC_Tree
             self.MC_Tree[tuple(state)] = [np.zeros(self.n_actions), np.zeros(self.n_actions), policy]
+            #把这个状态和策略存到树中，并且初始化该状态的Q值和N值都为0。Q值代表在状态s下采取动作a的最大回报，N值代表状态s下采取动作a的次数，Q值和N值的长度等于动作的数量。
 
     def simulate(self, states_to_expand:List[List[str]]) -> np.ndarray:
         """
@@ -299,23 +315,23 @@ class MCTS(sklearn.base.BaseEstimator, sklearn.base.RegressorMixin):
         return Q
 
     def neural_simulate(self, states_to_expand:List[List[str]]):
-        states = states_to_expand * self.repeat_times
-        while True:
+        states = states_to_expand * self.repeat_times # 每个state模拟self.repeat_times次
+        while True: 
             self.named_timer.add('simulate.pre')
-            policies, terminals = self.get_policy(states)
+            policies, terminals = self.get_policy(states) # policies是每个状态的策略，terminals代表每个状态是否已经结束（公式已经完整）
             self.named_timer.add('simulate.get_policy')
-            if not any(terminals): break
-            for idx, (state, policy, terminal) in enumerate(zip(states, policies, terminals)):
-                if not terminal: continue
-                action = self.actions[np.random.choice(self.n_actions, p=policy)]
-                states[idx] = self.act(state, action)
+            if not any(terminals): break # 如果全部中止，就跳出循环（这一步确保了每个状态都能到最后一步）
+            for idx, (state, policy, terminal) in enumerate(zip(states, policies, terminals)): # 对于每个状态
+                if not terminal: continue # 如果terminal信号为True，说明可以继续执行动作
+                action = self.actions[np.random.choice(self.n_actions, p=policy)]  # 根据策略选择一个动作
+                states[idx] = self.act(state, action) # 执行动作，states现在是执行了一次动作的新状态
             self.named_timer.add('simulate.rollout')
-        all_Q = self.get_rewards(states).reshape(self.repeat_times, len(states_to_expand))
+        all_Q = self.get_rewards(states).reshape(self.repeat_times, len(states_to_expand)) # 计算每个最终状态的奖励
         self.named_timer.add('simulate.reward')
         if not np.isfinite(all_Q).all(): 
             logger.error(f'Invalid Value in all_Q: {all_Q}')
             all_Q[~np.isfinite(all_Q)] = -np.inf
-        Q = np.max(all_Q, axis=0)
+        Q = np.max(all_Q, axis=0) # 只保留每个状态的最高奖励值。
         return Q
     
     def backpropagate(self, routes, Q):
@@ -329,20 +345,20 @@ class MCTS(sklearn.base.BaseEstimator, sklearn.base.RegressorMixin):
             Q value of each route's leaf node
         """
         for q, route in zip(Q, routes):
-            cur_state = tuple(route[0][1])
-            for action, next_state in route[1:]:
-                action_idx = self.action2idx[action]
-                self.MC_Tree[cur_state][0][action_idx] = max(q, self.MC_Tree[cur_state][0][action_idx])
-                self.MC_Tree[cur_state][1][action_idx] += 1
-                cur_state = tuple(next_state)
+            cur_state = tuple(route[0][1]) # 获取每个路径的根节点状态
+            for action, next_state in route[1:]: # 对于接下来的每个(动作，状态)对
+                action_idx = self.action2idx[action] # 获取每个动作的索引
+                self.MC_Tree[cur_state][0][action_idx] = max(q, self.MC_Tree[cur_state][0][action_idx]) # 更新当前节点对应动作的Q值
+                self.MC_Tree[cur_state][1][action_idx] += 1 # 更新n
+                cur_state = tuple(next_state) # 更新当前节点为下一个节点，目的是更新整条路经
 
     def act(self, prefix:List[str], action:str):
+        # prefix是状态列表，action是状态
         assert action in self.actions
         for idx, type in enumerate(prefix):
-            if type in ['node', 'edge']: break
+            if type in ['node', 'edge']: break #判断当前状态是否包含占位符（占位符分为两类，一类是node，一类是edge，当当前状态没有占位符时，说明这个公式已经完整填充）
         else: 
             raise ValueError(f'No placeholder in {prefix}')
-        
         if action in ['aggr', 'rgga']:
             assert type == 'node', f'{type} != node'
             return [*prefix[:idx], action, 'edge', *prefix[idx+1:]]
@@ -357,11 +373,12 @@ class MCTS(sklearn.base.BaseEstimator, sklearn.base.RegressorMixin):
             return [*prefix[:idx], action, *prefix[idx+1:]]
 
     def get_mask(self, prefix:List[str]):
+        # prefix是当前状态
         token_num = len(prefix)
-        for idx, type in enumerate(prefix):
-            if type in ['node', 'edge']: break
+        for idx, type in enumerate(prefix): 
+            if type in ['node', 'edge']: break# 如果当前状态中存在占位符，就说明当前状态不是最终状态。
         else:
-            return np.zeros((self.n_actions,), dtype=bool)
+            return np.zeros((self.n_actions,), dtype=bool) # 如何当前状态不存在占位，那么就没有后续动作
 
         mask = np.zeros((self.n_actions,), dtype=bool)
         vectorize = np.vectorize(self.action2idx.get, otypes=[int])
@@ -428,6 +445,16 @@ class MCTS(sklearn.base.BaseEstimator, sklearn.base.RegressorMixin):
     
     def get_rewards(self, states):
         rewards = np.array([self.get_reward(state)[0] for state in states])
+        # for state, reward in zip(states, rewards):
+        #     if not np.isfinite(reward) or reward <= 0: continue
+        #     try:
+        #         _, pwc = self.get_reward(state, use_cache=False, sample=False, update_cache=False)
+        #         if pwc is not None:
+        #             logger.info(f"[MCTS] reward={reward:.4f} | {GDExpr.prefix2str(pwc)}")
+        #         else:
+        #             logger.info(f"[MCTS] reward={reward:.4f} | {' '.join(state)}")
+        #     except:
+        #         logger.info(f"[MCTS] reward={reward:.4f} | {' '.join(state)}")
 
         if any(rewards >= self.best_metric['reward']):
             for idx, state in enumerate(states):
@@ -445,16 +472,16 @@ class MCTS(sklearn.base.BaseEstimator, sklearn.base.RegressorMixin):
         return rewards
 
     def get_reward(self, state:List[str], use_cache=True, update_cache=True, sample=True):
-        # Too complex
+        # 如果状态太长，（公式复杂），奖励为0
         if len(state) > self.max_token_num: return 0.0, None
-        # Non-terminal
+        # 如果状态中包含占位符（不是最终状态），奖励为0
         if 'node' in state or 'edge' in state: return 0.0, None
-        # Too many coefficients
+        # 如果常数过多，奖励为0
         if GDExpr.count_coef(state) > self.max_coeff_num: return 0.0, None
-        # Cache
+        # 如果之前计算过奖励，那么直接去缓存中的奖励，不用重新计算。
         if use_cache and tuple(state) in self.rewards: return self.rewards[tuple(state)], None
-
-        reward, prefix_with_coef = self.rewarder.solve(state, sample=sample, max_iter=30)
+        # 使用奖励求解器来求解当前状态的奖励和带系数的公式前缀(如果状态中含有'<C>',说明这里缺一个常数，而奖励求解器可以把这个常数也补充进去)
+        reward, prefix_with_coef = self.rewarder.solve(state, sample=sample, max_iter=30) # 奖励是跟loss挂钩的
         if update_cache: self.rewards[tuple(state)] = reward
         return reward, prefix_with_coef
 

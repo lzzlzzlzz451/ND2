@@ -24,7 +24,7 @@ class RewardSolver(object):
                  complexity_base=0.999,
                  sample_num=500,
                  **kwargs):
-        self.Xv = {k: np.array(v) for k, v in Xv.items()}
+        self.Xv = {k: np.array(v) for k, v in Xv.items()} # 每个节点的变量数据，key
         self.Xe = {k: np.array(v) for k, v in Xe.items()}
         self.A = np.array(A)
         self.G = np.array(G)
@@ -61,11 +61,10 @@ class RewardSolver(object):
 
         V, E = self.A.shape[0], self.G.shape[0]
         num_C, num_Cv, num_Ce = prefix.count('<C>'), prefix.count('<Cv>'), prefix.count('<Ce>')
-
-        N = int(np.ceil(self.sample_num / self.Y.shape[1]))
+        N = int(np.ceil(self.sample_num / self.Y.shape[1])) # self.Y是(T, V)，一共有T个样本，每个样本V维,表示V个节点，N代表采样数量
         T = self.Y.shape[0]
         if sample and (N < T):
-            sample_idx = np.random.choice(T, N, replace=False)
+            sample_idx = np.random.choice(T, N, replace=False) # 从T个样本中随机选择N个样本, 每个节点包含几个维度
             var_dict = {'A': self.A, 'G': self.G, 'out': self.Y[sample_idx]} | \
                        {k: (v[sample_idx] if v.ndim > 1 else v) for k, v in self.Xv.items()} | \
                        {k: (v[sample_idx] if v.ndim > 1 else v) for k, v in self.Xe.items()}
@@ -94,7 +93,7 @@ class RewardSolver(object):
             true = Y
             if self.mask is not None:
                 return np.mean((pred - true)[mask] ** 2)
-            return np.mean((pred - true) ** 2)
+            return np.mean((pred - true) ** 2) # 计算预测值与真实值的均方误差，真实值 来自于采样的数据
 
         if num_C + num_Cv + num_Ce == 0:
             MSE = loss(np.empty(0))
@@ -105,7 +104,7 @@ class RewardSolver(object):
                         '<Ce>': np.random.randn(num_Ce, E)}
             x0 = np.concatenate([x0['<C>'], x0['<Cv>'].reshape(-1), x0['<Ce>'].reshape(-1)])
             if max_iter > 0:
-                res = minimize(loss, x0, method=method, options={'maxiter': max_iter})
+                res = minimize(loss, x0, method=method, options={'maxiter': max_iter}) # 这个minimize函数会返回一个结果对象，包含最优的Loss值和对应的参数。这个函数使用了L-BFGS-B算法来进行优化
                 MSE = res.fun
                 coef_dict = params2coefdict(res.x)
             else:

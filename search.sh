@@ -8,4 +8,5 @@ python search.py --data ./data/synthetic/LV.json --vars x alpha theta --name Lot
 python search.py --data ./data/synthetic/MP.json --vars x alpha theta --name Mutualistic-Population --seed 0
 python search.py --data ./data/synthetic/SIS.json --vars x delta --name Susceptible-Infected-Susceptible --seed 0
 python search.py --data ./data/synthetic/GR.json --vars x --name Gene-Regulatory --seed 0
+python search.py --data ./data/ant/antS4.json --vars x y vx vy --name Ant-Track --seed 0
 

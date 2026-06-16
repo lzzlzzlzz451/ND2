@@ -604,10 +604,10 @@ class GDExprClass:
 
     def _eval(self, prefix:List[str], var_dict:dict, coef_list:List[float], coeff_count:tuple=(0,0,0), **kwargs):
         if len(prefix) == 0: raise ValueError('Empty prefix')
-        item, prefix = prefix[0], prefix[1:]
+        item, prefix = prefix[0], prefix[1:] # 只看item(prefix[0])，剩下的继续递归
 
         if isinstance(item, np.ndarray): return item, prefix, coeff_count
-        if item in self.operator.unary:
+        if item in self.operator.unary: # 递归的运算
             val1, prefix, coeff_count = self._eval(prefix, var_dict, coef_list, coeff_count, **kwargs)
         if item in self.operator.binary:
             val1, prefix, coeff_count = self._eval(prefix, var_dict, coef_list, coeff_count, **kwargs)
