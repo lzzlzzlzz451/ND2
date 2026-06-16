@@ -167,3 +167,4 @@ data/synthetic/*
 *.bak.py
 weights/*.pth
 
+data/fish/schooling_nd2.json
