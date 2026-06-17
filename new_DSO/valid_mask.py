@@ -50,60 +50,53 @@ class ValidMaskComputer:
             )
  
     def compute_mask(self, prefix_token_ids, dangling, coeff_counts, has_variable=False):
-        n_words = self.vocab.n_words
         mask = np.zeros(self._max_id + 1, dtype=bool)
         remaining = self.max_length - len(prefix_token_ids)
         if remaining <= 0 or dangling <= 0:
             return mask
     
-        # 追踪当前待填充位置的类型
         current_type = self._get_current_type(prefix_token_ids)
     
-        # ★ 关键：第一步和表达式太短时，强制选算子，不允许直接出变量结束
-        is_first_token = len(prefix_token_ids) == 0
-        too_short = len(prefix_token_ids) < 2  # 至少2个token才算合法表达式
-    
-        # ---- 算子总是开放（受长度和类型约束） ----
-        # 二元算子：需要 remaining >= 3（算子 + 2个参数各至少1 token）
-        if remaining >= 3:
+        # ================================================================
+        # 硬约束：算子受 dangling 限制，保证表达式必定能填完
+        # ================================================================
+        # 选二元算子后 dangling+1，需 remaining-1 >= dangling+1 → remaining >= dangling+2
+        if remaining >= dangling + 2:
             mask[list(self._binary_ids)] = True
-        # 一元算子：需要 remaining >= 2
-        if remaining >= 2:
+        # 选一元算子后 dangling 不变，需 remaining-1 >= dangling → remaining >= dangling+1
+        if remaining >= dangling + 1:
             mask[list(self._unary_ids)] = True
     
-        # ---- 类型约束：禁止类型不匹配的图算子 ----
+        # ================================================================
+        # 类型约束：禁止类型不匹配的图算子
+        # ================================================================
         if current_type == 'edge':
             for tid in self._unary_ids:
                 token = self.vocab.id2word.get(tid, '')
                 if token in ('aggr', 'rgga'):
                     mask[tid] = False
-            # edge + dangling==1：二元算子会增加 dangling，不允许
-            if dangling == 1:
-                mask[list(self._binary_ids)] = False
         elif current_type == 'node':
             for tid in self._unary_ids:
                 token = self.vocab.id2word.get(tid, '')
                 if token in ('sour', 'targ'):
                     mask[tid] = False
     
-        # ---- 强制至少使用一个变量（dangling==1 且无变量时） ----
-        if dangling == 1 and not has_variable:
-            # 禁止直接结束，必须继续生长
-            # 关掉所有终止符（变量、常量、系数）
-            mask[list(self._variable_node_ids)] = False
-            mask[list(self._variable_edge_ids)] = False
-            mask[list(self.vocab.tokens_of_kind('constant'))] = False
-            mask[self.vocab.word2id.get('<C>', -1)] = False
-            mask[self.vocab.word2id.get('<Cv>', -1)] = False
-            mask[self.vocab.word2id.get('<Ce>', -1)] = False
-            # 只保留算子（上面已经开了，类型约束也处理了）
-            return mask
+        # ================================================================
+        # 终止符：选后 dangling-1，需 remaining-1 >= dangling-1 → remaining >= dangling
+        # ================================================================
+        # 软约束：鼓励先选算子再出终止符
+        force_grow = (len(prefix_token_ids) == 0        # 第一步必须选算子
+                    or len(prefix_token_ids) < 2       # 太短不合法
+                    or (dangling == 1 and not has_variable))  # 还没变量不能结束
     
-        # ---- ★ 终止符：第一步和太短时不开放 ----
-        allow_terminators = not is_first_token and not too_short
+        any_operator_available = mask.any()
     
-        if remaining >= 1 and allow_terminators:
-            # 变量
+        # 只在"算子可选"时抑制终止符；算子不可选时必须允许终止符，否则死路
+        if force_grow and any_operator_available:
+            # 抑制终止符，强制继续生长
+            pass
+        else:
+            # 开放变量
             if current_type == 'node':
                 mask[list(self._variable_node_ids)] = True
             elif current_type == 'edge':
@@ -112,7 +105,7 @@ class ValidMaskComputer:
                 mask[list(self._variable_node_ids)] = True
                 mask[list(self._variable_edge_ids)] = True
     
-            # 常量/系数：子树中必须有变量才允许
+            # 开放常量/系数
             constant_ok = has_variable or self._check_constant_ok(prefix_token_ids)
             if not constant_ok:
                 constant_ok = dangling > 1 or len(prefix_token_ids) > 0
@@ -121,8 +114,6 @@ class ValidMaskComputer:
                     mask[list(self.vocab.tokens_of_kind('constant'))] = True
                 if coeff_counts[0] < self.max_coeff_num and current_type != 'edge':
                     mask[self.vocab.word2id.get('<C>', -1)] = True
-                # if coeff_counts[1] < self.max_node_coeff_num and current_type in ('node', 'scalar', 'any'):
-                #     mask[self.vocab.word2id.get('<Cv>', -1)] = True
     
         return mask
     

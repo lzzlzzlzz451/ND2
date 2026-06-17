@@ -32,7 +32,8 @@ class Program:
  
         # 第二步：补全表达式（同前，省略）
         self.token_ids = self._complete_expression(token_ids)
-        self.prefix = [vocab.id2word[tid] for tid in self.token_ids]
+        # self.prefix = [vocab.id2word[tid] for tid in self.token_ids]
+        self.prefix = [vocab.id2word[tid] for tid in self.token_ids if tid != vocab.pad_id]
  
         # 惰性奖励
         self._reward = None

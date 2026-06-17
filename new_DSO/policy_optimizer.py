@@ -9,7 +9,7 @@ import logging
 from typing import List, Optional, Tuple
 from .program import Program
 from .vocabulary import Vocabulary
-from .policy import RNVPolicy
+from .policy import TransformerPolicy
 from .valid_mask import ValidMaskComputer
  
 logger = logging.getLogger('new_DSO.PolicyOptimizer')
@@ -64,7 +64,7 @@ class DSOOptimizer:
     - PQT: 额外从历史优先队列中采样混入训练
     """
     def __init__(self,
-                 policy: RNVPolicy,
+                 policy: TransformerPolicy,
                  vocab: Vocabulary,
                  valid_mask_computer: ValidMaskComputer,
                  device: str = 'cpu',

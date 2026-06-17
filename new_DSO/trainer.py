@@ -64,7 +64,20 @@ class NewDSOTrainer:
         self.policy = TransformerPolicy(self.vocab, self.config)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.policy.to(self.device)
+
+        # ★ 加载预训练权重
+        pretrain_path = './weights/new_dso_pretrained.pth'
+        if os.path.exists(pretrain_path):
+            ckpt = torch.load(pretrain_path, map_location=self.device, weights_only=True)
+            self.policy.load_state_dict(ckpt['policy'])
+            logger.info(f"[new_DSO] 加载预训练权重: {pretrain_path} (epoch={ckpt.get('epoch','?')}, loss={ckpt.get('loss','?'):.4f})")
+        else:
+            logger.warning(f"[new_DSO] 预训练权重不存在: {pretrain_path}，使用随机初始化")
  
+        self.policy.eval()
+        for param in self.policy.parameters():
+            param.requires_grad = False
+        logger.info("[new_DSO] 策略网络已冻结，搜索过程中不更新参数")
         self.gdexpr = GDExprClass(self.config)
  
         # 数据
@@ -249,13 +262,21 @@ class NewDSOTrainer:
     # ============================================================
     def _update_best(self, program):
         """更新全局最优"""
+        if not program.is_terminal():
+            return
         self.best_reward = program.reward
         self.best_program = program
         self.best_prefix_with_coef = program.prefix_with_coef
         if self.reward_solver is not None:
-            self.best_metrics = self.reward_solver.evaluate(
-                program.prefix_with_coef, {}
+        # 先用 solve() 拟合系数，拿到 prefix_with_coef（<C> 已替换为数值）
+            reward, prefix_with_coef = self.reward_solver.solve(
+                program.prefix, sample=False
             )
+            # 再用 evaluate() 计算各项指标
+            self.best_metrics = self.reward_solver.evaluate(
+                prefix_with_coef, {}
+            )
+            self.best_metrics['reward'] = reward
         logger.note(
             f"[new_DSO] ★ 新最优! reward={self.best_reward:.6f} | "
             f"R²={self.best_metrics.get('R2', 'N/A')} | "
@@ -442,6 +463,7 @@ class NewDSOTrainer:
             f"ε={tc.epsilon} | n_samples={tc.n_samples} | "
             f"device={self.device}"
         )
+        self.policy.eval()
  
         try:
             total_evals = 0   
@@ -492,7 +514,7 @@ class NewDSOTrainer:
                 n_updates = 3  # 固定更新次数，避免过拟合
                 stats = {}
                 for u in range(n_updates):
-                    stats = self.policy_update(elite_programs, elite_rewards, baseline)
+                    # stats = self.policy_update(elite_programs, elite_rewards, baseline)
                     if not stats or stats.get('total_loss', 1) == 0:
                         break
  
@@ -547,7 +569,12 @@ class NewDSOTrainer:
         logger.note(f"  总耗时: {total_time:.1f}s")
         logger.note(f"  最优奖励: {self.best_reward:.6f}")
         if self.best_prefix_with_coef:
-            logger.note(f"  最优表达式: {GDExpr.prefix2str(self.best_prefix_with_coef)}")
+            # 改后
+            try:
+                expr_str = GDExpr.prefix2str(self.best_prefix_with_coef)
+            except (ValueError, IndexError) as e:
+                expr_str = ' '.join(str(x) for x in self.best_prefix_with_coef) + f"  (格式异常: {e})"
+            logger.note(f"  最优表达式: {expr_str}")
         for k, v in self.best_metrics.items():
             logger.note(f"  {k}: {v}")
         logger.note("=" * 60)

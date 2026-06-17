@@ -114,7 +114,7 @@ class TransformerPolicy(nn.Module):
         causal_mask = self._generate_causal_mask(L, device)
  
         # Memory: (1, B, d_model) → expand to (1, B, d_model)
-        memory = self.memory_param.expand(1, B, -1)  # (1, B, d_model)
+        memory = self.memory_param.expand(B, -1, -1)  # (1, B, d_model)
  
         # Transformer decode
         x = self.decoder(
