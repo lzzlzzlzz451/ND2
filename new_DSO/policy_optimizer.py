@@ -126,73 +126,85 @@ class DSOOptimizer:
         return stats
  
     def _compute_losses(self, programs, advantages, prior_bias):
-        def _check(tensor, name, t):
-            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-                n_nan = torch.isnan(tensor).sum().item()
-                n_inf = torch.isinf(tensor).sum().item()
-                logger.warning(f"[NaN-DEBUG] t={t} | {name}: shape={tensor.shape} | "
-                            f"nan={n_nan} inf={n_inf} | "
-                            f"min={tensor[~torch.isnan(tensor)].min().item() if (~torch.isnan(tensor)).any() else 'all_nan'} | "
-                            f"max={tensor[~torch.isnan(tensor)].max().item() if (~torch.isnan(tensor)).any() else 'all_nan'}")
-    
-        # _check(advantages, "advantages", -1)
-        max_len = max(len(p.token_ids) for p in programs); E = len(programs)
-        has_var = torch.zeros(E, dtype=torch.bool, device=self.device)
-        actions_t = torch.full((E, max_len), self.vocab.pad_id, dtype=torch.long, device=self.device)
+        max_len = max(len(p.token_ids) for p in programs)
+        E = len(programs)
+ 
+        # 构造输入序列：SOS + token_ids + padding
+        actions_t = torch.full((E, max_len + 1), self.vocab.pad_id,
+                               dtype=torch.long, device=self.device)
         lengths = []
         for i, p in enumerate(programs):
-            L = len(p.token_ids); actions_t[i, :L] = torch.tensor(p.token_ids, dtype=torch.long); lengths.append(L)
-        danglings = torch.ones(E, dtype=torch.long); coeff_c = torch.zeros(E, dtype=torch.long)
-        coeff_cv = torch.zeros(E, dtype=torch.long); coeff_ce = torch.zeros(E, dtype=torch.long)
+            L = len(p.token_ids)
+            # 位置 0 = SOS，位置 1~L = token_ids
+            actions_t[i, 0] = self.vocab.sos_id
+            actions_t[i, 1:L+1] = torch.tensor(p.token_ids, dtype=torch.long)
+            lengths.append(L)
+ 
+        # ★ 一次性前向传播整个序列
+        all_logits = self.policy.forward_full(actions_t)  # (E, L+1, n_actions)
+ 
+        # 逐步计算 nll 和 entropy（和 mask 相关逻辑不变）
+        all_nll = []
+        all_ent = []
+        all_w = []
+ 
+        has_var = torch.zeros(E, dtype=torch.bool, device=self.device)
+        danglings = torch.ones(E, dtype=torch.long)
+        coeff_c = torch.zeros(E, dtype=torch.long)
+        coeff_cv = torch.zeros(E, dtype=torch.long)
+        coeff_ce = torch.zeros(E, dtype=torch.long)
         finished = torch.zeros(E, dtype=torch.bool)
-        all_nll = []; all_ent = []; all_w = []
-        cur = torch.full((E,), self.vocab.sos_id, dtype=torch.long, device=self.device); hidden = None
+ 
         for t in range(max_len):
-            logits, hidden = self.policy(cur, hidden)
-
-            # _check(logits, "logits_raw", t)
-            if isinstance(hidden, tuple):  # LSTM
-                hidden = (hidden[0].detach(), hidden[1].detach())
-            elif hidden is not None:       # GRU
-                hidden = hidden.detach()
+            # logits for position t+1 (预测第 t 个 token)
+            logits = all_logits[:, t, :]  # (E, n_actions)
+ 
             if prior_bias:
                 for tid, b in prior_bias.items():
                     if tid >= 0: logits[:, tid] += b
+ 
+            # 计算 valid mask（和原来一样）
             pl, dl, cl = [], [], []
             for i in range(E):
-                if finished[i]: pl.append([]); dl.append(0); cl.append((0,0,0))
+                if finished[i]:
+                    pl.append([]); dl.append(0); cl.append((0, 0, 0))
                 else:
-                    va = [a for a in actions_t[i,:t].cpu().tolist() if a != self.vocab.pad_id]
-                    pl.append(va); dl.append(danglings[i].item()); cl.append((coeff_c[i].item(), coeff_cv[i].item(), coeff_ce[i].item()))
+                    va = actions_t[i, 1:t+1].cpu().tolist()
+                    va = [a for a in va if a != self.vocab.pad_id]
+                    pl.append(va)
+                    dl.append(danglings[i].item())
+                    cl.append((coeff_c[i].item(), coeff_cv[i].item(), coeff_ce[i].item()))
             has_var_list = has_var.cpu().tolist()
             vm = self.valid_mask_computer.compute_mask_batch(pl, dl, cl, has_variables=has_var_list)
             vmt = torch.from_numpy(vm).to(self.device)
             for i in range(E): vmt[i, :] = vmt[i, :] & ~finished[i]
+ 
             logits = logits.masked_fill(~vmt, -1e8)
-    
-            # ★ 修复：已完成样本全为 -inf 时给 dummy 值，避免 NaN
             all_masked = (logits <= -1e7).all(dim=-1)
             logits[all_masked, 0] = 0.0
-
-            # _check(logits, "logits_after_mask", t)
-    
-            log_p = F.log_softmax(logits, dim=-1); prob = torch.exp(log_p)
-            # _check(log_p, "log_probs", t)   # ★ 诊断
-            # _check(prob, "prob", t)  
+ 
+            log_p = F.log_softmax(logits, dim=-1)
+            prob = torch.exp(log_p)
             ent = -(prob * log_p).sum(dim=-1)
-            ent = torch.nan_to_num(ent, nan=0.0)   # 0 * -inf = NaN → 0
-            act = actions_t[:, t]
+            ent = torch.nan_to_num(ent, nan=0.0)
+ 
+            # 目标 action
+            act = actions_t[:, t + 1]  # 第 t 个 token
             nll = F.nll_loss(log_p, act, reduction='none', ignore_index=self.vocab.pad_id)
             nll = torch.nan_to_num(nll, nan=0.0)
-
-            # _check(ent, "entropy", t)   # ★ 诊断
-            # _check(nll, "nll", t)    
-            vp = torch.tensor([t < lengths[i] and not finished[i] for i in range(E)], dtype=torch.bool, device=self.device)
-            all_nll.append(nll); all_ent.append(ent); all_w.append(vp.float())
+ 
+            vp = torch.tensor([t < lengths[i] and not finished[i] for i in range(E)],
+                              dtype=torch.bool, device=self.device)
+            all_nll.append(nll)
+            all_ent.append(ent)
+            all_w.append(vp.float())
+ 
+            # 更新状态追踪
             for i in range(E):
                 if finished[i]: continue
                 tid = act[i].item()
-                if tid == self.vocab.pad_id: finished[i] = True; continue
+                if tid == self.vocab.pad_id:
+                    finished[i] = True; continue
                 danglings[i] = danglings[i] - 1 + self.vocab.arity(tid)
                 k = self.vocab.kind(tid)
                 if k == 'coefficient': coeff_c[i] += 1
@@ -200,8 +212,10 @@ class DSOOptimizer:
                 elif k == 'edge_coeff': coeff_ce[i] += 1
                 if k == 'variable': has_var[i] = True
                 if danglings[i] <= 0: finished[i] = True
-            cur = act.detach() if t+1 < max_len else act
-        nll_m = torch.stack(all_nll, 1); ent_m = torch.stack(all_ent, 1); w_m = torch.stack(all_w, 1)
+ 
+        nll_m = torch.stack(all_nll, 1)
+        ent_m = torch.stack(all_ent, 1)
+        w_m = torch.stack(all_w, 1)
         adv_exp = advantages.unsqueeze(1).expand_as(nll_m)
         tw = w_m.sum()
         if tw > 0:
@@ -211,8 +225,6 @@ class DSOOptimizer:
             pg = torch.tensor(0.0, device=self.device)
             ent_mean = torch.tensor(0.0, device=self.device)
         ent_loss = -self.entropy_weight * ent_mean
-        # _check(pg, "pg_loss", -2)        # ★ 诊断
-        # _check(ent_loss, "ent_loss", -2)
         return pg, ent_loss
     
     def _pqt_step(self, prior_bias=None) -> Optional[torch.Tensor]:

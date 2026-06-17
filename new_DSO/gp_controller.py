@@ -135,13 +135,15 @@ class NDGPController:
         # 3. 保留精英
         n_elite = max(1, int(self.elite_fraction * len(population)))
         elites = population[:n_elite]
+
+        target_size = max(self.population_size, n_elite + self.max_offspring)
  
         # 4. 产生后代
         offspring = list(elites)  # 精英直接保留
         attempts = 0
         max_attempts = self.max_offspring * 3  # 防止无限循环
  
-        while len(offspring) < self.population_size and attempts < max_attempts:
+        while len(offspring) < target_size and attempts < max_attempts:
             attempts += 1
             r = np.random.random()
  
@@ -152,9 +154,11 @@ class NDGPController:
                 # 变异
                 parent = self._tournament_select(population)
                 child = self._mutate(parent)
- 
+
             if child is not None:
-                offspring.append(child)
+                # ★ 去重：避免缓存命中导致重复
+                if child not in offspring:
+                    offspring.append(child)
  
         # 5. 去掉精英，只返回 GP 新产生的个体
         gp_programs = offspring[n_elite:]

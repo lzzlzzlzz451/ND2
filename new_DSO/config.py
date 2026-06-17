@@ -37,14 +37,15 @@ def get_default_config():
  
         # ---- RNN 策略网络 ----
         'policy': AttrDict({
-            'hidden_size': 64,
-            'num_layers': 2,
-            'cell_type': 'lstm',       # 'lstm' 或 'gru'
-            'embedding_size': 32,
-            'max_length': 30,          # 表达式最大 token 数
-            'max_coeff_num': 5,        # 最大标量系数数量
-            'max_node_coeff_num': 3,   # 最大节点系数数量
-            'max_edge_coeff_num': 3,   # 最大边系数数量
+            'd_model': 128,            # Transformer 隐层维度（原 hidden_size=64）
+            'nhead': 4,                # 注意力头数
+            'num_layers': 3,           # Transformer 层数（原 RNN 2层）
+            'dim_feedforward': 256,    # FFN 中间层维度
+            'dropout': 0.1,           # Dropout
+            'max_length': 30,         # 表达式最大 token 数
+            'max_coeff_num': 5,
+            'max_node_coeff_num': 3,
+            'max_edge_coeff_num': 3,
         }),
  
         # ---- 训练 ----

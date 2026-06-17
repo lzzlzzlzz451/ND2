@@ -14,7 +14,7 @@ from typing import List, Dict, Optional, Callable
 from .config import get_default_config
 from .vocabulary import Vocabulary
 from .valid_mask import ValidMaskComputer
-from .policy import RNVPolicy
+from .policy import TransformerPolicy
 from .program import Program
 from .gp_controller import NDGPController
 from .risk_seeking import RiskSeekingSelector
@@ -61,7 +61,7 @@ class NewDSOTrainer:
         self.vocab = Vocabulary(self.config)
         self.valid_mask_computer = ValidMaskComputer(self.vocab, self.config)
  
-        self.policy = RNVPolicy(self.vocab, self.config)
+        self.policy = TransformerPolicy(self.vocab, self.config)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.policy.to(self.device)
  
@@ -229,6 +229,7 @@ class NewDSOTrainer:
     # ============================================================
     def select_elite(self, programs, rewards):
         return self.risk_selector.select(programs, rewards)
+    
  
     # ============================================================
     # 第六步：计算基线
@@ -261,7 +262,60 @@ class NewDSOTrainer:
             f"RMSE={self.best_metrics.get('RMSE', 'N/A')} | "
             f"expr={GDExpr.prefix2str(program.prefix_with_coef)}"
         )
- 
+    
+    def _log_formulas(self, all_programs, all_rewards, elite_programs, elite_rewards,
+                  step, file_path='./log/formulas.csv'):
+        """
+        将每步的中间公式写入文件。
+        - Top-10 全部样本
+        - 全部精英样本
+        """
+        import csv
+        with open(file_path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+
+            # ---- Top-10 全部样本 ----
+            sorted_indices = np.argsort(all_rewards)[::-1]
+            for rank, idx in enumerate(sorted_indices[:10]):
+                p = all_programs[idx]
+                r = all_rewards[idx]
+                prefix_str = ' '.join(p.prefix)
+                try:
+                    # 优先用带系数的版本
+                    if p.prefix_with_coef is not None:
+                        expr_str = GDExpr.prefix2str(p.prefix_with_coef)
+                    else:
+                        expr_str = GDExpr.prefix2str(p.prefix)
+                except Exception:
+                    expr_str = prefix_str
+                metrics = p.metrics if p.metrics else {}
+                writer.writerow([
+                    step, 'top10', rank,
+                    f'{r:.6f}',
+                    f"{metrics.get('R2', 'N/A')}",
+                    f"{metrics.get('RMSE', 'N/A')}",
+                    prefix_str, expr_str,
+                ])
+    
+            # ---- 全部精英样本 ----
+            for rank, (p, r) in enumerate(zip(elite_programs, elite_rewards)):
+                prefix_str = ' '.join(p.prefix)
+                try:
+                    if p.prefix_with_coef is not None:
+                        expr_str = GDExpr.prefix2str(p.prefix_with_coef)
+                    else:
+                        expr_str = GDExpr.prefix2str(p.prefix)
+                except Exception:
+                    expr_str = prefix_str
+                metrics = p.metrics if p.metrics else {}
+                writer.writerow([
+                    step, 'elite', rank,
+                    f'{r:.6f}',
+                    f"{metrics.get('R2', 'N/A')}",
+                    f"{metrics.get('RMSE', 'N/A')}",
+                    prefix_str, expr_str,
+                ])
+
     def _check_early_stop(self, early_stop_fn=None):
         """
         第八步早停判断:
@@ -374,6 +428,10 @@ class NewDSOTrainer:
             log_every: int, 每隔几步打印日志
             save_every: int, 每隔几步保存 checkpoint
         """
+        formula_path = './log/new_dso/KUR/formulas.csv'
+        os.makedirs(os.path.dirname(formula_path), exist_ok=True)
+        with open(formula_path, 'w', encoding='utf-8') as f:
+            f.write('step,category,rank,reward,R2,RMSE,prefix,expr\n')
         if early_stop_fn is None:
             early_stop_fn = lambda m: m.get('ACC4', 0) > 0.99 or m.get('R2', -np.inf) > 0.99
  
@@ -417,6 +475,14 @@ class NewDSOTrainer:
                 # ---- 第五步: 风险寻求精英筛选 ----
                 elite_programs, elite_rewards, quantile = \
                     self.select_elite(all_programs, all_rewards)
+                
+                # ★ 写入中间公式
+                self._log_formulas(
+                    all_programs, all_rewards,
+                    elite_programs, elite_rewards,
+                    step=self.step_count,
+                    file_path='./log/new_dso/KUR/formulas.csv',
+                )
  
                 # ---- 第六步: 计算基线 ----
                 baseline = self.compute_baseline(elite_rewards, all_rewards, quantile)

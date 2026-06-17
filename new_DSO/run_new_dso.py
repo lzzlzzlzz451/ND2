@@ -11,14 +11,14 @@ def main():
     init_logger('new_DSO_KUR', './log/new_dso/KUR/info.log', root_name='new_DSO')
     config = get_default_config()
     config.data.root_type = 'node'
-    config.training.entropy_weight = 1.0 
+    config.training.entropy_weight = 1.0
     config.training.n_samples = 100000
     config.training.seed = 42
-    config.data.complexity_base = 0.7
+    config.data.complexity_base = 0.999
     config.training.batch_size = 1024  # 旧: 256，更多样本
-    config.training.epsilon = 0.05    # 旧: 0.05，选 top 10% 作 elite
+    config.training.epsilon = 0.1    # 旧: 0.05，选 top 10% 作 elite
     config.training.baseline_mode = 'ewma_R'
-    config.policy.max_length = 10
+    config.policy.max_length = 20
     config.gp.n_offspring = 50
     config.gp.n_generations = 3
  

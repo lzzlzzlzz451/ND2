@@ -56,63 +56,53 @@ class ValidMaskComputer:
         if remaining <= 0 or dangling <= 0:
             return mask
     
-        # ★ 核心改动：追踪当前待填充位置的类型
+        # 追踪当前待填充位置的类型
         current_type = self._get_current_type(prefix_token_ids)
-        
-        # 强制至少使用一个变量（即将完成且没变量时）
-        if dangling == 1 and not has_variable:
-            if remaining >= 2:
-                mask[list(self._binary_ids)] = True
-            if remaining >= 1:
-                mask[list(self._unary_ids)] = True
-            
-            # ★ 早返回也要类型约束！
-            if current_type == 'edge':
-                for tid in self._unary_ids:
-                    token = self.vocab.id2word.get(tid, '')
-                    if token in ('aggr', 'rgga'):
-                        mask[tid] = False
-                # edge 上下文：不允许二元算子（会增加 dangling）
-                mask[list(self._binary_ids)] = False
-            elif current_type == 'node':
-                for tid in self._unary_ids:
-                    token = self.vocab.id2word.get(tid, '')
-                    if token in ('sour', 'targ'):
-                        mask[tid] = False
-            
-            # 变量
-            if current_type == 'node':
-                mask[list(self._variable_node_ids)] = True
-            elif current_type == 'edge':
-                mask[list(self._variable_edge_ids)] = True
-            else:
-                mask[list(self._variable_node_ids)] = True
-                mask[list(self._variable_edge_ids)] = True
-            return mask
     
-        # 二元算子：需要 remaining >= 2 + 1（算子本身 + 2个参数至少1个token）
+        # ★ 关键：第一步和表达式太短时，强制选算子，不允许直接出变量结束
+        is_first_token = len(prefix_token_ids) == 0
+        too_short = len(prefix_token_ids) < 2  # 至少2个token才算合法表达式
+    
+        # ---- 算子总是开放（受长度和类型约束） ----
+        # 二元算子：需要 remaining >= 3（算子 + 2个参数各至少1 token）
         if remaining >= 3:
             mask[list(self._binary_ids)] = True
-        # 一元算子
+        # 一元算子：需要 remaining >= 2
         if remaining >= 2:
             mask[list(self._unary_ids)] = True
     
-        # ★ 类型约束（和 ND2 的 get_mask 一致）
+        # ---- 类型约束：禁止类型不匹配的图算子 ----
         if current_type == 'edge':
-            # edge 上下文：禁止 aggr（aggr 输出 node，但这里需要 edge）
             for tid in self._unary_ids:
                 token = self.vocab.id2word.get(tid, '')
                 if token in ('aggr', 'rgga'):
                     mask[tid] = False
+            # edge + dangling==1：二元算子会增加 dangling，不允许
+            if dangling == 1:
+                mask[list(self._binary_ids)] = False
         elif current_type == 'node':
-            # node 上下文：禁止 sour/targ（它们输出 edge，但这里需要 node）
             for tid in self._unary_ids:
                 token = self.vocab.id2word.get(tid, '')
                 if token in ('sour', 'targ'):
                     mask[tid] = False
     
-        # 终止符（变量/常量/系数）：remaining >= 1
-        if remaining >= 1:
+        # ---- 强制至少使用一个变量（dangling==1 且无变量时） ----
+        if dangling == 1 and not has_variable:
+            # 禁止直接结束，必须继续生长
+            # 关掉所有终止符（变量、常量、系数）
+            mask[list(self._variable_node_ids)] = False
+            mask[list(self._variable_edge_ids)] = False
+            mask[list(self.vocab.tokens_of_kind('constant'))] = False
+            mask[self.vocab.word2id.get('<C>', -1)] = False
+            mask[self.vocab.word2id.get('<Cv>', -1)] = False
+            mask[self.vocab.word2id.get('<Ce>', -1)] = False
+            # 只保留算子（上面已经开了，类型约束也处理了）
+            return mask
+    
+        # ---- ★ 终止符：第一步和太短时不开放 ----
+        allow_terminators = not is_first_token and not too_short
+    
+        if remaining >= 1 and allow_terminators:
             # 变量
             if current_type == 'node':
                 mask[list(self._variable_node_ids)] = True
@@ -122,10 +112,9 @@ class ValidMaskComputer:
                 mask[list(self._variable_node_ids)] = True
                 mask[list(self._variable_edge_ids)] = True
     
-            # ★ constant_ok 检查（和 ND2 一致：子树中必须有变量才允许常量）
+            # 常量/系数：子树中必须有变量才允许
             constant_ok = has_variable or self._check_constant_ok(prefix_token_ids)
             if not constant_ok:
-                # 回退检查：当前不是根位置（dangling > 1 或前缀非空），允许常数
                 constant_ok = dangling > 1 or len(prefix_token_ids) > 0
             if constant_ok:
                 if current_type != 'edge':

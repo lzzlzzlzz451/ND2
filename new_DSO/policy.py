@@ -1,19 +1,17 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from .vocabulary import Vocabulary   # ← 加这一行
+from .vocabulary import Vocabulary
  
-class RNVPolicy(nn.Module):
+ 
+class TransformerPolicy(nn.Module):
     """
-    基于 LSTM/GRU 的自回归策略网络，用于逐步采样前缀表达式的 token。
+    基于 Transformer Decoder 的自回归策略网络，替代原来的 LSTM。
  
-    与 ND2 的 Transformer 解码器不同，这里采用 DSO 风格的 RNN：
-    - 每一步输入当前观察（上一步的 action embedding + 位置编码 + 先验偏置）
-    - 输出所有 token 的 logits
-    - 结合 valid mask 进行合法采样
- 
-    关键创新：融入 ND 图算子的类型约束作为先验偏置
+    每一步输入完整的 prefix 序列，通过因果自注意力输出下一步 logits。
+    相比 RNN 的优势：直接 attend 所有历史 token，不依赖压缩的 hidden state。
     """
     def __init__(self, vocab: Vocabulary, config):
         super().__init__()
@@ -21,81 +19,139 @@ class RNVPolicy(nn.Module):
         self.config = config
         pc = config.policy
  
-        self.n_words = vocab.n_words
         self._n_actions = max(vocab.word2id.values()) + 1
-        self.hidden_size = pc.hidden_size
-        self.num_layers = pc.num_layers
         self.max_length = pc.max_length
-        self.embedding_size = pc.embedding_size
+        self.d_model = pc.d_model
  
         # Token embedding
-        self.token_embedding = nn.Embedding(self._n_actions, self.embedding_size,
+        self.token_embedding = nn.Embedding(self._n_actions, self.d_model,
                                             padding_idx=vocab.pad_id)
  
-        # 位置编码（可学习）
-        self.position_embedding = nn.Embedding(self.max_length + 1, self.embedding_size)
+        # 位置编码（正弦余弦，不可学习）
+        self.pos_encoding = self._build_sinusoidal_encoding(self.max_length + 1, self.d_model)
  
-        # RNN cell
-        if pc.cell_type == 'lstm':
-            self.rnn = nn.LSTM(
-                input_size=self.embedding_size,
-                hidden_size=self.hidden_size,
-                num_layers=self.num_layers,
-                batch_first=False,
-            )
-        elif pc.cell_type == 'gru':
-            self.rnn = nn.GRU(
-                input_size=self.embedding_size,
-                hidden_size=self.hidden_size,
-                num_layers=self.num_layers,
-                batch_first=False,
-            )
-        else:
-            raise ValueError(f"Unsupported cell type: {pc.cell_type}")
+        # Dropout
+        self.embed_dropout = nn.Dropout(pc.dropout)
  
-        # 输出头: logits
-        self.output_head = nn.Linear(self.hidden_size, self._n_actions)
- 
-        # 初始观察 embedding (t=0 时使用)
-        self.initial_obs_embedding = nn.Parameter(
-            torch.randn(1, 1, self.embedding_size) * 0.01
+        # Transformer Decoder
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.d_model,
+            nhead=pc.nhead,
+            dim_feedforward=pc.dim_feedforward,
+            dropout=pc.dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,  # Pre-LN，训练更稳定
+        )
+        self.decoder = nn.TransformerDecoder(
+            decoder_layer=decoder_layer,
+            num_layers=pc.num_layers,
         )
  
-    def forward(self, actions, hidden=None):
+        # 用全零 memory 代替 encoder 输出（纯解码器模式）
+        # memory 是 (1, B, d_model) 的可学习参数，模拟全局上下文
+        self.memory_param = nn.Parameter(
+            torch.randn(1, 1, self.d_model) * 0.02
+        )
+ 
+        # Layer Norm
+        self.ln_f = nn.LayerNorm(self.d_model)
+ 
+        # 输出头
+        self.output_head = nn.Linear(self.d_model, self._n_actions)
+ 
+        self._init_weights()
+ 
+    def _init_weights(self):
+        """Xavier 初始化"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.padding_idx is not None:
+                    nn.init.zeros_(module.weight[module.padding_idx])
+ 
+    @staticmethod
+    def _build_sinusoidal_encoding(max_len, d_model):
+        """标准正弦余弦位置编码"""
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe  # (max_len, d_model)，不注册为 buffer 也没关系，推理时不会变
+ 
+    def _generate_causal_mask(self, seq_len, device):
         """
-        单步前向传播。
+        生成因果注意力掩码：位置 i 只能看到 ≤ i 的位置。
+        返回 (seq_len, seq_len) 的 bool mask，True 表示禁止注意。
+        """
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        return mask
+ 
+    def forward_full(self, prefix_ids):
+        """
+        给定完整 prefix 序列，输出每个位置的 logits。
  
         参数:
-            actions: (B,) 上一步采样的 token id，t=0 时为 SOS
-            hidden: RNN 隐状态，t=0 时为 None
+            prefix_ids: (B, L) int，SOS 开头的 token id 序列
  
         返回:
-            logits: (B, n_words)
-            new_hidden: 更新后的隐状态
+            logits: (B, L, n_actions) 每个位置的 logits
         """
-        # (B,) -> (1, B, embedding_size)
-        emb = self.token_embedding(actions).unsqueeze(0)
-        output, new_hidden = self.rnn(emb, hidden)
-        # output: (1, B, hidden_size)
-        logits = self.output_head(output.squeeze(0))  # (B, n_words)
-        return logits, new_hidden
+        B, L = prefix_ids.shape
+        device = prefix_ids.device
+ 
+        # Token + Position embedding
+        tok_emb = self.token_embedding(prefix_ids)  # (B, L, d_model)
+        pos_emb = self.pos_encoding[:L].unsqueeze(0).to(device)  # (1, L, d_model)
+        x = self.embed_dropout(tok_emb + pos_emb)
+ 
+        # Causal mask
+        causal_mask = self._generate_causal_mask(L, device)
+ 
+        # Memory: (1, B, d_model) → expand to (1, B, d_model)
+        memory = self.memory_param.expand(1, B, -1)  # (1, B, d_model)
+ 
+        # Transformer decode
+        x = self.decoder(
+            tgt=x,                    # (B, L, d_model)
+            memory=memory,            # (1, B, d_model)
+            tgt_mask=causal_mask,     # (L, L)
+            tgt_is_causal=True,
+        )  # (B, L, d_model)
+ 
+        x = self.ln_f(x)
+        logits = self.output_head(x)  # (B, L, n_actions)
+        return logits
+ 
+    def forward_step(self, prefix_ids):
+        """
+        单步前向：给定 prefix，输出最后一个位置的 logits。
+        兼容旧的 step-by-step 调用方式，但内部用完整序列前向。
+ 
+        参数:
+            prefix_ids: (B, L) int，SOS 开头的前缀序列
+ 
+        返回:
+            logits: (B, n_actions) 最后一个位置的 logits
+        """
+        all_logits = self.forward_full(prefix_ids)  # (B, L, n_actions)
+        return all_logits[:, -1, :]  # (B, n_actions)
  
     def sample(self, batch_size, valid_mask_computer, device='cpu', prior_bias=None):
         """
         自回归采样一个 batch 的前缀表达式。
  
-        参数:
-            batch_size: int
-            valid_mask_computer: ValidMaskComputer
-            device: str
-            prior_bias: 可选的先验偏置 dict(token_id -> bias)
- 
         返回:
-            actions_batch: (B, L) int, 采样的 token id 序列
-            log_probs_batch: (B, L) float, 每个 token 的对数概率
-            entropies_batch: (B, L) float, 每个 token 的熵
-            finished_batch: (B,) bool, 表达式是否完整
-            masks_batch: (B, L) bool, 有效位置掩码（含 padding）
+            actions_batch: (B, L) int
+            log_probs_batch: (B, L) float
+            entropies_batch: (B, L) float
+            finished_batch: (B,) bool
+            masks_batch: (B, L) bool
         """
         self.eval()
         with torch.no_grad():
@@ -110,24 +166,22 @@ class RNVPolicy(nn.Module):
             finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
             has_var = torch.zeros(batch_size, dtype=torch.bool, device=device)
  
-            # 初始输入: SOS token
-            current_actions = torch.full((batch_size,), self.vocab.sos_id,
-                                          dtype=torch.long, device=device)
-            hidden = None
- 
-            # 追踪每个序列的悬空节点数和系数计数
+            # 追踪每个序列的状态
             danglings = torch.ones(batch_size, dtype=torch.long, device=device)
             coeff_c = torch.zeros(batch_size, dtype=torch.long, device=device)
             coeff_cv = torch.zeros(batch_size, dtype=torch.long, device=device)
             coeff_ce = torch.zeros(batch_size, dtype=torch.long, device=device)
  
-            # 逐步采样
+            # prefix 从 SOS 开始
+            prefix = torch.full((batch_size, 1), self.vocab.sos_id,
+                                dtype=torch.long, device=device)
+ 
             for t in range(max_L):
                 if finished.all():
                     break
  
-                # 前向传播得到 logits
-                logits, hidden = self.forward(current_actions, hidden)  # (B, n_words)
+                # 前向传播：输入完整 prefix，取最后位置 logits
+                logits = self.forward_step(prefix)  # (B, n_actions)
  
                 # 加入先验偏置
                 if prior_bias is not None:
@@ -135,7 +189,6 @@ class RNVPolicy(nn.Module):
                         logits[:, token_id] += bias
  
                 # 计算每个样本的有效掩码
-                # （将 tensor 转为 numpy 来调用 valid_mask_computer）
                 prefix_lists = []
                 dangling_list = []
                 coeff_list = []
@@ -145,61 +198,40 @@ class RNVPolicy(nn.Module):
                         dangling_list.append(0)
                         coeff_list.append((0, 0, 0))
                     else:
-                        # 取当前已采样的有效 token
-                        valid_actions = actions_batch[i, :t].cpu().tolist()
-                        valid_actions = [a for a in valid_actions
-                                         if a != self.vocab.pad_id]
+                        # prefix 中去掉 SOS
+                        valid_actions = prefix[i, 1:].cpu().tolist()
+                        valid_actions = [a for a in valid_actions if a != self.vocab.pad_id]
                         prefix_lists.append(valid_actions)
                         dangling_list.append(danglings[i].item())
                         coeff_list.append((coeff_c[i].item(),
                                            coeff_cv[i].item(),
                                            coeff_ce[i].item()))
-                
+ 
                 has_var_list = has_var.cpu().tolist()
                 valid_masks = valid_mask_computer.compute_mask_batch(
                     prefix_lists, dangling_list, coeff_list, has_variables=has_var_list
-                )  # (B, n_words), numpy bool
+                )
  
-                # 已完成的样本掩码全 False
                 for i in range(batch_size):
                     if finished[i]:
                         valid_masks[i, :] = False
  
                 valid_masks_t = torch.from_numpy(valid_masks).to(device)
- 
-                # 将不合法 token 的 logits 设为 -inf
                 logits = logits.masked_fill(~valid_masks_t, -1e8)
-
+ 
                 all_masked = (logits <= -1e7).all(dim=-1)
-                logits[all_masked, 0] = 0.0  # 给个 dummy，反正不会用到
+                logits[all_masked, 0] = 0.0
  
                 # 计算概率分布
-                probs = F.softmax(logits, dim=-1)  # (B, n_words)
-
-                with open(f'log/step_{t}_probs.log', 'w') as f:
-                    for i in range(batch_size):
-                        if finished[i]:
-                            continue
-                        current_type = valid_mask_computer._get_current_type(prefix_lists[i])
-                        f.write(f'[Step {t} Sample {i}] expected_type={current_type}\n')
-                        f.write(f'[Step {t} Sample {i}] all probs:\n')
-                        for tid in range(self.vocab.n_words):
-                            p = probs[i, tid].item()
-                            if p > 0:
-                                f.write(f'  {self.vocab.id2word[tid]}: {p:.4f}\n')
-                        # ★ 加这段：打印 mask 中允许的 token
-                        vm = valid_masks[i]
-                        allowed = [self.vocab.id2word[tid] for tid in range(self.vocab.n_words) if vm[tid]]
-                        f.write(f'[Step {t} Sample {i}] mask_allowed: {allowed}\n')
+                probs = F.softmax(logits, dim=-1)
  
                 # 采样
                 dist = torch.distributions.Categorical(probs)
                 sampled = dist.sample()  # (B,)
  
-                # 记录
-                step_log_probs = dist.log_prob(sampled)   # (B,)
-                step_entropies = dist.entropy()           # (B,)
-                
+                step_log_probs = dist.log_prob(sampled)
+                step_entropies = dist.entropy()
+ 
                 for i in range(batch_size):
                     if not finished[i]:
                         actions_batch[i, t] = sampled[i]
@@ -214,7 +246,8 @@ class RNVPolicy(nn.Module):
                         if self.vocab.kind(tid) == 'variable': has_var[i] = True
                         if danglings[i] <= 0: finished[i] = True
  
-                current_actions = sampled
+                # ★ 关键区别：拼接到 prefix，而非只传上一个 token
+                prefix = torch.cat([prefix, sampled.unsqueeze(1)], dim=1)  # (B, t+2)
  
             return (actions_batch, log_probs_batch, entropies_batch,
                     finished, masks_batch)
