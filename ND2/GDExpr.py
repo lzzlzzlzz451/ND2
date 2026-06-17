@@ -609,7 +609,7 @@ class GDExprClass:
         if isinstance(item, np.ndarray): return item, prefix, coeff_count
         if item in self.operator.unary: # 递归的运算
             val1, prefix, coeff_count = self._eval(prefix, var_dict, coef_list, coeff_count, **kwargs)
-        if item in self.operator.binary:
+        elif item in self.operator.binary:
             val1, prefix, coeff_count = self._eval(prefix, var_dict, coef_list, coeff_count, **kwargs)
             val2, prefix, coeff_count = self._eval(prefix, var_dict, coef_list, coeff_count, **kwargs)
 

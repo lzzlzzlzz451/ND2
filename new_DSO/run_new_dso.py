@@ -18,7 +18,7 @@ def main():
     config.training.batch_size = 1024  # 旧: 256，更多样本
     config.training.epsilon = 0.1    # 旧: 0.05，选 top 10% 作 elite
     config.training.baseline_mode = 'ewma_R'
-    config.policy.max_length = 30
+    config.policy.max_length = 20
     config.gp.n_offspring = 50
     config.gp.n_generations = 3
  

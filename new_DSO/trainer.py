@@ -268,15 +268,17 @@ class NewDSOTrainer:
         self.best_program = program
         self.best_prefix_with_coef = program.prefix_with_coef
         if self.reward_solver is not None:
-        # 先用 solve() 拟合系数，拿到 prefix_with_coef（<C> 已替换为数值）
-            reward, prefix_with_coef = self.reward_solver.solve(
-                program.prefix, sample=False
-            )
-            # 再用 evaluate() 计算各项指标
-            self.best_metrics = self.reward_solver.evaluate(
-                prefix_with_coef, {}
-            )
-            self.best_metrics['reward'] = reward
+            try:
+                reward, prefix_with_coef = self.reward_solver.solve(
+                    program.prefix, sample=False
+                )
+                self.best_metrics = self.reward_solver.evaluate(
+                    prefix_with_coef, {}
+                )
+                self.best_metrics['reward'] = reward
+            except Exception as e:
+                logger.warning(f"[new_DSO] _update_best solve 失败: {e}，跳过该程序")
+                return   # ← solve 失败就不更新 best
         logger.note(
             f"[new_DSO] ★ 新最优! reward={self.best_reward:.6f} | "
             f"R²={self.best_metrics.get('R2', 'N/A')} | "
