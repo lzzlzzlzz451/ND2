@@ -74,10 +74,10 @@ class NewDSOTrainer:
         else:
             logger.warning(f"[new_DSO] 预训练权重不存在: {pretrain_path}，使用随机初始化")
  
-        self.policy.eval()
-        for param in self.policy.parameters():
-            param.requires_grad = False
-        logger.info("[new_DSO] 策略网络已冻结，搜索过程中不更新参数")
+        # self.policy.eval()
+        # for param in self.policy.parameters():
+        #     param.requires_grad = False
+        # logger.info("[new_DSO] 策略网络已冻结，搜索过程中不更新参数")
         self.gdexpr = GDExprClass(self.config)
  
         # 数据
@@ -157,6 +157,11 @@ class NewDSOTrainer:
         self.start_time = None
         self.step_count = 0
         self.history = []  # 每步的摘要记录
+
+        self._last_probs = None
+        self._last_actions = None
+        self._last_masks = None
+        self._prob_vis_interval = 50   # 每 50 步可视化一次
  
         Program.clear_cache()
         Program.clear_reward_cache()
@@ -171,13 +176,18 @@ class NewDSOTrainer:
     # ============================================================
     def sample_batch(self, batch_size=None):
         batch_size = batch_size or self.config.training.batch_size
-        actions, log_probs, entropies, finished, masks = \
+        actions, log_probs, entropies, finished, masks, probs = \
             self.policy.sample(
                 batch_size=batch_size,
                 valid_mask_computer=self.valid_mask_computer,
                 device=self.device
                 # prior_bias=self._get_prior_bias()
             )
+
+        self._last_probs = probs        # (B, L, n_actions)
+        self._last_actions = actions    # (B, L)
+        self._last_masks = masks        # (B, L)
+
         programs = []
         for i in range(batch_size):
             valid_mask_i = masks[i]
@@ -516,7 +526,7 @@ class NewDSOTrainer:
                 n_updates = 3  # 固定更新次数，避免过拟合
                 stats = {}
                 for u in range(n_updates):
-                    # stats = self.policy_update(elite_programs, elite_rewards, baseline)
+                    stats = self.policy_update(elite_programs, elite_rewards, baseline)
                     if not stats or stats.get('total_loss', 1) == 0:
                         break
  
@@ -539,6 +549,9 @@ class NewDSOTrainer:
                 # 日志
                 if self.step_count % log_every == 0:
                     self._log_step(stats, time.time() - self.start_time)
+
+                if self.step_count % self._prob_vis_interval == 0 and self._last_probs is not None:
+                    self._visualize_probs(self.step_count)
  
                 # 保存 checkpoint
                 if checkpoint_path and self.step_count % save_every == 0:
@@ -588,3 +601,92 @@ class NewDSOTrainer:
     # ============================================================
     # 辅助
     # ============================================================
+    def _visualize_probs(self, step):
+        """从训练 batch 中选 top-3 表达式，可视化每步 token 概率分布"""
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    
+        probs = self._last_probs          # (B, L, n_actions)
+        actions = self._last_actions      # (B, L)
+        masks = self._last_masks          # (B, L)
+    
+        token_names = [self.vocab.id2word.get(i, f'?{i}') 
+                    for i in range(probs.shape[-1])]
+    
+        # 选序列最长的前3个样本（信息最丰富）
+        lengths = masks.sum(dim=1)
+        top_indices = torch.argsort(lengths, descending=True)[:3]
+    
+        save_dir = f'./log/prob_vis/step_{step:04d}'
+        os.makedirs(save_dir, exist_ok=True)
+    
+        for sample_idx in top_indices.cpu().tolist():
+            seq_len = int(lengths[sample_idx].item())
+            if seq_len == 0:
+                continue
+    
+            sampled_ids = actions[sample_idx, :seq_len].cpu().tolist()
+            sampled_names = [token_names[tid] for tid in sampled_ids]
+    
+            # --- 每步 bar chart ---
+            for t in range(seq_len):
+                p = probs[sample_idx, t].cpu().numpy()    # (n_actions,)
+                top_k = 15
+                top_idx = np.argsort(p)[::-1][:top_k]
+                names = [token_names[i] for i in top_idx]
+                vals = [p[i] for i in top_idx]
+                colors = ['#e74c3c' if i == sampled_ids[t] else '#3498db' 
+                        for i in top_idx]
+    
+                fig, ax = plt.subplots(figsize=(8, 4))
+                bars = ax.bar(range(len(names)), vals, color=colors)
+                ax.set_xticks(range(len(names)))
+                ax.set_xticklabels(names, rotation=45, ha='right')
+                ax.set_ylabel('Probability')
+                ax.set_title(
+                    f'Step {step} | Sample {sample_idx} | t={t} | '
+                    f'sampled [{sampled_names[t]}] (p={p[sampled_ids[t]]:.4f})\n'
+                    f'Expr: {" ".join(sampled_names[:t+1])}'
+                )
+                ax.set_ylim(0, max(vals) * 1.2 if vals else 1.0)
+                for bar, val in zip(bars, vals):
+                    ax.text(bar.get_x() + bar.get_width()/2, 
+                            bar.get_height() + 0.005,
+                            f'{val:.3f}', ha='center', va='bottom', fontsize=7)
+                plt.tight_layout()
+                fig.savefig(f'{save_dir}/sample{sample_idx}_step{t:02d}.png', dpi=150)
+                plt.close(fig)
+    
+            # --- 热力图：该样本所有步 × 高频 token ---
+            all_top = set()
+            for t in range(seq_len):
+                p = probs[sample_idx, t].cpu().numpy()
+                all_top.update(np.argsort(p)[::-1][:10].tolist())
+            all_top = sorted(all_top)
+    
+            heatmap = np.array([probs[sample_idx, t, all_top].cpu().numpy() 
+                            for t in range(seq_len)])
+            xlabels = [token_names[i] for i in all_top]
+            ylabels = [f't={t}' for t in range(seq_len)]
+    
+            fig, ax = plt.subplots(figsize=(max(8, len(all_top)*0.6), 
+                                            max(3, seq_len*0.5)))
+            im = ax.imshow(heatmap, aspect='auto', cmap='YlOrRd')
+            ax.set_xticks(range(len(all_top)))
+            ax.set_xticklabels(xlabels, rotation=45, ha='right')
+            ax.set_yticks(range(seq_len))
+            ax.set_yticklabels(ylabels)
+            ax.set_title(f'Step {step} | Sample {sample_idx} | '
+                        f'Expr: {" ".join(sampled_names)}')
+            fig.colorbar(im, ax=ax, shrink=0.6)
+            for t, tid in enumerate(sampled_ids):
+                if tid in all_top:
+                    x = all_top.index(tid)
+                    ax.add_patch(plt.Rectangle((x-0.5, t-0.5), 1, 1,
+                                fill=False, edgecolor='blue', lw=2))
+            plt.tight_layout()
+            fig.savefig(f'{save_dir}/sample{sample_idx}_heatmap.png', dpi=150)
+            plt.close(fig)
+    
+        logger.info(f"[new_DSO] 概率可视化已保存到 {save_dir}/")

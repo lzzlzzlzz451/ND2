@@ -163,6 +163,7 @@ class TransformerPolicy(nn.Module):
             log_probs_batch = torch.zeros(batch_size, max_L, device=device)
             entropies_batch = torch.zeros(batch_size, max_L, device=device)
             masks_batch = torch.zeros(batch_size, max_L, dtype=torch.bool, device=device)
+            probs_batch = torch.zeros(batch_size, max_L, self._n_actions, device=device)
             finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
             has_var = torch.zeros(batch_size, dtype=torch.bool, device=device)
  
@@ -238,6 +239,7 @@ class TransformerPolicy(nn.Module):
                         log_probs_batch[i, t] = step_log_probs[i]
                         entropies_batch[i, t] = step_entropies[i]
                         masks_batch[i, t] = True
+                        probs_batch[i, t] = probs[i]
                         tid = sampled[i].item()
                         danglings[i] = danglings[i] - 1 + self.vocab.arity(tid)
                         if self.vocab.kind(tid) == 'coefficient': coeff_c[i] += 1
@@ -250,4 +252,4 @@ class TransformerPolicy(nn.Module):
                 prefix = torch.cat([prefix, sampled.unsqueeze(1)], dim=1)  # (B, t+2)
  
             return (actions_batch, log_probs_batch, entropies_batch,
-                    finished, masks_batch)
+                    finished, masks_batch, probs_batch)

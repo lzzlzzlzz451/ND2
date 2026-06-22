@@ -225,6 +225,9 @@ class DSOOptimizer:
             pg = torch.tensor(0.0, device=self.device)
             ent_mean = torch.tensor(0.0, device=self.device)
         ent_loss = -self.entropy_weight * ent_mean
+        pg = pg / (pg.detach().abs().mean() + 1e-8)     # 归一化到 ~1.0
+        ent_mean = ent_mean / (ent_mean.detach().abs().mean() + 1e-8)  # 归一化到 ~1.0
+        ent_loss = -self.entropy_weight * ent_mean
         return pg, ent_loss
     
     def _pqt_step(self, prior_bias=None) -> Optional[torch.Tensor]:

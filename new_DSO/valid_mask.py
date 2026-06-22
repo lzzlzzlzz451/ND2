@@ -55,15 +55,21 @@ class ValidMaskComputer:
         if remaining <= 0 or dangling <= 0:
             return mask
     
+        # ================================================================
+        # ★ 硬约束：预算不够填完 dangling 个槽位 → 表达式不可能完成，判死
+        # ================================================================
+        if remaining < dangling:
+            return mask   # 全零，调用方应将此序列标记为 finished
+    
         current_type = self._get_current_type(prefix_token_ids)
     
         # ================================================================
-        # 硬约束：算子受 dangling 限制，保证表达式必定能填完
+        # 算子：受 remaining vs dangling 约束
         # ================================================================
-        # 选二元算子后 dangling+1，需 remaining-1 >= dangling+1 → remaining >= dangling+2
+        # remaining == dangling 时，选任何算子都会导致填不完（二元+1槽，一元不变但不减槽）
+        # 所以 remaining == dangling 时算子全部禁止，只能选终止符
         if remaining >= dangling + 2:
             mask[list(self._binary_ids)] = True
-        # 选一元算子后 dangling 不变，需 remaining-1 >= dangling → remaining >= dangling+1
         if remaining >= dangling + 1:
             mask[list(self._unary_ids)] = True
     
@@ -84,10 +90,13 @@ class ValidMaskComputer:
         # ================================================================
         # 终止符：选后 dangling-1，需 remaining-1 >= dangling-1 → remaining >= dangling
         # ================================================================
-        # 软约束：鼓励先选算子再出终止符
-        force_grow = (len(prefix_token_ids) == 0        # 第一步必须选算子
-                    or len(prefix_token_ids) < 2       # 太短不合法
-                    or (dangling == 1 and not has_variable))  # 还没变量不能结束
+        # ★ 关键修改：remaining == dangling 时，force_grow 必须为 False
+        #   因为此时不选终止符就填不完，必须强制开放终止符
+        force_grow = (
+            len(prefix_token_ids) == 0        # 第一步必须选算子
+            or len(prefix_token_ids) < 2      # 太短不合法
+            or (dangling == 1 and not has_variable)  # 还没变量不能结束
+        ) and remaining > dangling  # ★ 新增：预算紧张时取消强制生长
     
         any_operator_available = mask.any()
     
