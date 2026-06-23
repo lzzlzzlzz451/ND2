@@ -340,7 +340,7 @@ def pretrain():
         optimizer, T_0=5, T_mult=2
     )
  
-    n_epochs = 50
+    n_epochs = 10
     best_loss = float('inf')
  
     for epoch in range(n_epochs):

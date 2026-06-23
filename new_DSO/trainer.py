@@ -74,10 +74,10 @@ class NewDSOTrainer:
         else:
             logger.warning(f"[new_DSO] 预训练权重不存在: {pretrain_path}，使用随机初始化")
  
-        # self.policy.eval()
-        # for param in self.policy.parameters():
-        #     param.requires_grad = False
-        # logger.info("[new_DSO] 策略网络已冻结，搜索过程中不更新参数")
+        self.policy.eval()
+        for param in self.policy.parameters():
+            param.requires_grad = False
+        logger.info("[new_DSO] 策略网络已冻结，搜索过程中不更新参数")
         self.gdexpr = GDExprClass(self.config)
  
         # 数据
@@ -526,7 +526,7 @@ class NewDSOTrainer:
                 n_updates = 3  # 固定更新次数，避免过拟合
                 stats = {}
                 for u in range(n_updates):
-                    stats = self.policy_update(elite_programs, elite_rewards, baseline)
+                    # stats = self.policy_update(elite_programs, elite_rewards, baseline)
                     if not stats or stats.get('total_loss', 1) == 0:
                         break
  
