@@ -9,27 +9,23 @@ import logging
 from typing import List, Optional, Tuple
 from .program import Program
 from .vocabulary import Vocabulary
-from .policy import TransformerPolicy
+from .policy import GNNTransformerPolicy
 from .valid_mask import ValidMaskComputer
  
 logger = logging.getLogger('new_DSO.PolicyOptimizer')
  
  
 class PQTBuffer:
-    """
-    Prioritized Queue Training (PQT) 缓冲区。
-    维护历史最佳样本，训练时混入 elite batch。
-    """
+    """Prioritized Queue Training (PQT) 缓冲区。"""
     def __init__(self, max_size: int = 50):
         self.max_size = max_size
-        self._buffer = []  # List of (reward, token_ids, prefix)
+        self._buffer = []
  
     def push(self, programs: List[Program], rewards: np.ndarray):
         for p, r in zip(programs, rewards):
             if not np.isfinite(r) or not p.is_terminal():
                 continue
             self._buffer.append((r, tuple(p.token_ids), p.prefix))
-        # 只保留 top-k
         self._buffer.sort(key=lambda x: x[0], reverse=True)
         self._buffer = self._buffer[:self.max_size]
  
@@ -48,23 +44,10 @@ class DSOOptimizer:
     """
     第七步：策略梯度更新。
  
-    核心: 对 elite 样本重新前向传播 RNN，计算 neglogp，然后:
-        pg_loss    = mean((r - baseline) * neglogp)
-        entropy_loss = -entropy_weight * mean(entropy)
-        loss = pg_loss + entropy_loss
- 
-    关键细节:
-    - 采样阶段 self.policy.sample() 在 no_grad 下完成
-    - 此处需要对 elite 的 action 序列重新跑一遍 RNN forward，这次带梯度
-    - 逐步输入 action → 得到 logits → softmax → 计算交叉熵 → 得到 neglogp
-    - 用 valid_mask 保证只对合法位置计算 loss
- 
-    支持 PG / PQT 两种模式:
-    - PG (Vanilla Policy Gradient): 默认，只用当前 elite
-    - PQT: 额外从历史优先队列中采样混入训练
+    ★ 改造：forward_full 调用传入 graph_emb；优化器只更新 requires_grad 参数。
     """
     def __init__(self,
-                 policy: TransformerPolicy,
+                 policy: GNNTransformerPolicy,
                  vocab: Vocabulary,
                  valid_mask_computer: ValidMaskComputer,
                  device: str = 'cpu',
@@ -80,11 +63,13 @@ class DSOOptimizer:
         self.device = device
         self.entropy_weight = entropy_weight
         self.clip_grad_norm = clip_grad_norm
-        self.mode = mode  # 'PG' or 'PQT'
+        self.mode = mode
  
-        self.optimizer = torch.optim.Adam(
-            self.policy.parameters(), lr=learning_rate
-        )
+        # ★ 只优化 requires_grad=True 的参数（冻结的编码器不参与）
+        trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.Adam(trainable_params, lr=learning_rate)
+        logger.info(f"[Optimizer] 可训练参数: {sum(p.numel() for p in trainable_params):,} / "
+                     f"{sum(p.numel() for p in self.policy.parameters()):,}")
  
         # PQT 缓冲区
         self.pqt_buffer = PQTBuffer(max_size=pqt_max_size)
@@ -93,36 +78,53 @@ class DSOOptimizer:
         # 训练统计
         self._step_count = 0
  
+        # ★ graph_emb 引用（由外部设置）
+        self.graph_emb = None
+ 
+    def set_graph_emb(self, graph_emb):
+        """设置预计算的图 embedding（由 NewDSO.encode_data 产出）"""
+        self.graph_emb = graph_emb
+ 
     def update(self, elite_programs, elite_rewards, baseline, prior_bias=None):
-        if not elite_programs: return {}
+        if not elite_programs:
+            return {}
         self.policy.train()
         advantages = torch.tensor(elite_rewards - baseline, dtype=torch.float32, device=self.device)
         pg_loss, entropy_loss = self._compute_losses(elite_programs, advantages, prior_bias)
         if self.mode == 'PQT' and len(self.pqt_buffer) > 0:
             pql = self._pqt_step(prior_bias)
-            if pql is not None: pg_loss = pg_loss + 0.5 * pql
+            if pql is not None:
+                pg_loss = pg_loss + 0.5 * pql
         total_loss = pg_loss + entropy_loss
         self.optimizer.zero_grad()
         total_loss.backward()
-    
-        # ★ NaN 梯度保护：检测到 NaN 就跳过更新
+ 
+        # NaN 梯度保护
         has_nan = any(
             p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any())
-            for p in self.policy.parameters()
+            for p in self.policy.parameters() if p.requires_grad
         )
         if has_nan:
             logger.warning("[Optimizer] NaN 梯度，跳过更新")
             self.optimizer.zero_grad()
             return {'pg_loss': 0.0, 'entropy_loss': 0.0, 'total_loss': 0.0,
                     'grad_norm': 0.0, 'n_elite': len(elite_programs), 'baseline': baseline}
-    
-        gn = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.clip_grad_norm)
+ 
+        # ★ 只 clip 可训练参数的梯度
+        trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
+        gn = torch.nn.utils.clip_grad_norm_(trainable_params, self.clip_grad_norm)
         self.optimizer.step()
         self._step_count += 1
-        if self.mode == 'PQT': self.pqt_buffer.push(elite_programs, elite_rewards)
-        stats = {'pg_loss': pg_loss.item(), 'entropy_loss': entropy_loss.item(), 'total_loss': total_loss.item(),
-                'grad_norm': gn.item(), 'advantage_mean': advantages.mean().item(), 'n_elite': len(elite_programs), 'baseline': baseline}
-        logger.info(f"[Optimizer] pg={stats['pg_loss']:.4f} ent={stats['entropy_loss']:.4f} total={stats['total_loss']:.4f} grad={stats['grad_norm']:.2f}")
+        if self.mode == 'PQT':
+            self.pqt_buffer.push(elite_programs, elite_rewards)
+        stats = {
+            'pg_loss': pg_loss.item(), 'entropy_loss': entropy_loss.item(),
+            'total_loss': total_loss.item(), 'grad_norm': gn.item(),
+            'advantage_mean': advantages.mean().item(),
+            'n_elite': len(elite_programs), 'baseline': baseline
+        }
+        logger.info(f"[Optimizer] pg={stats['pg_loss']:.4f} ent={stats['entropy_loss']:.4f} "
+                     f"total={stats['total_loss']:.4f} grad={stats['grad_norm']:.2f}")
         return stats
  
     def _compute_losses(self, programs, advantages, prior_bias):
@@ -135,15 +137,13 @@ class DSOOptimizer:
         lengths = []
         for i, p in enumerate(programs):
             L = len(p.token_ids)
-            # 位置 0 = SOS，位置 1~L = token_ids
             actions_t[i, 0] = self.vocab.sos_id
             actions_t[i, 1:L+1] = torch.tensor(p.token_ids, dtype=torch.long)
             lengths.append(L)
  
-        # ★ 一次性前向传播整个序列
-        all_logits = self.policy.forward_full(actions_t)  # (E, L+1, n_actions)
+        # ★ 传入 graph_emb
+        all_logits = self.policy.forward_full(actions_t, graph_emb=self.graph_emb)
  
-        # 逐步计算 nll 和 entropy（和 mask 相关逻辑不变）
         all_nll = []
         all_ent = []
         all_w = []
@@ -156,14 +156,13 @@ class DSOOptimizer:
         finished = torch.zeros(E, dtype=torch.bool)
  
         for t in range(max_len):
-            # logits for position t+1 (预测第 t 个 token)
-            logits = all_logits[:, t, :]  # (E, n_actions)
+            logits = all_logits[:, t, :]
  
             if prior_bias:
                 for tid, b in prior_bias.items():
-                    if tid >= 0: logits[:, tid] += b
+                    if tid >= 0:
+                        logits[:, tid] += b
  
-            # 计算 valid mask（和原来一样）
             pl, dl, cl = [], [], []
             for i in range(E):
                 if finished[i]:
@@ -177,7 +176,8 @@ class DSOOptimizer:
             has_var_list = has_var.cpu().tolist()
             vm = self.valid_mask_computer.compute_mask_batch(pl, dl, cl, has_variables=has_var_list)
             vmt = torch.from_numpy(vm).to(self.device)
-            for i in range(E): vmt[i, :] = vmt[i, :] & ~finished[i]
+            for i in range(E):
+                vmt[i, :] = vmt[i, :] & ~finished[i]
  
             logits = logits.masked_fill(~vmt, -1e8)
             all_masked = (logits <= -1e7).all(dim=-1)
@@ -188,8 +188,7 @@ class DSOOptimizer:
             ent = -(prob * log_p).sum(dim=-1)
             ent = torch.nan_to_num(ent, nan=0.0)
  
-            # 目标 action
-            act = actions_t[:, t + 1]  # 第 t 个 token
+            act = actions_t[:, t + 1]
             nll = F.nll_loss(log_p, act, reduction='none', ignore_index=self.vocab.pad_id)
             nll = torch.nan_to_num(nll, nan=0.0)
  
@@ -199,12 +198,13 @@ class DSOOptimizer:
             all_ent.append(ent)
             all_w.append(vp.float())
  
-            # 更新状态追踪
             for i in range(E):
-                if finished[i]: continue
+                if finished[i]:
+                    continue
                 tid = act[i].item()
                 if tid == self.vocab.pad_id:
-                    finished[i] = True; continue
+                    finished[i] = True
+                    continue
                 danglings[i] = danglings[i] - 1 + self.vocab.arity(tid)
                 k = self.vocab.kind(tid)
                 if k == 'coefficient': coeff_c[i] += 1
@@ -225,22 +225,16 @@ class DSOOptimizer:
             pg = torch.tensor(0.0, device=self.device)
             ent_mean = torch.tensor(0.0, device=self.device)
         ent_loss = -self.entropy_weight * ent_mean
-        pg = pg / (pg.detach().abs().mean() + 1e-8)     # 归一化到 ~1.0
-        ent_mean = ent_mean / (ent_mean.detach().abs().mean() + 1e-8)  # 归一化到 ~1.0
+        # pg = pg / (pg.detach().abs().mean() + 1e-8)
+        # ent_mean = ent_mean / (ent_mean.detach().abs().mean() + 1e-8)
         ent_loss = -self.entropy_weight * ent_mean
         return pg, ent_loss
-    
+ 
     def _pqt_step(self, prior_bias=None) -> Optional[torch.Tensor]:
-        """
-        PQT 模式：从历史优先队列中采样，用 MLE 损失训练。
-        即最大化历史最优样本的 log 概率。
-        """
         n_pqt = max(1, int(self.pqt_mix_ratio * len(self.pqt_buffer)))
         samples = self.pqt_buffer.sample(n_pqt)
         if not samples:
             return None
- 
-        # 构造伪 Program 用于前向传播
         pseudo_programs = []
         for token_ids_tuple, prefix in samples:
             prog = Program.__new__(Program)
@@ -250,8 +244,6 @@ class DSOOptimizer:
             prog.config = self.policy.config
             prog._reward = None
             pseudo_programs.append(prog)
- 
-        # PQT 用均匀 advantage = 1.0（即最大化 log 概率）
         advantages = torch.ones(len(pseudo_programs), device=self.device)
         pg_loss, _ = self._compute_losses(pseudo_programs, advantages, prior_bias)
         return pg_loss

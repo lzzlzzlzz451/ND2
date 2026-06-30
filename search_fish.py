@@ -95,9 +95,9 @@ def main(args):
     # %% 可选：验证 ground truth 作为 baseline
     if args.eval_baseline:
         gt_prefix = [
-            'div', 'aggr', 'mul', 'M', 'mul', 'add', 'mul', '<C>', 'sin', 'phi',
-            'mul', 'rho', 'sin', 'theta_vis', 'add', '1', 'cos', 'theta_vis',
-            'aggr', 'mul', 'M', 'add', '1', 'cos', 'theta_vis'
+            'div', 'aggr', 'mul', 'e1', 'mul', 'add', 'mul', '<C>', 'sin', 'e3',
+            'mul', 'e2', 'sin', 'e4', 'add', '1', 'cos', 'e4',
+            'aggr', 'mul', 'e1', 'add', '1', 'cos', 'e4'
         ]
         # 直接传已知系数 Ip=9.0，不需要先 solve
         metrics = rewarder.evaluate(gt_prefix, {'<C>': [9.0]})

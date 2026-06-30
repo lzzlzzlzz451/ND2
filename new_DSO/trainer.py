@@ -14,7 +14,8 @@ from typing import List, Dict, Optional, Callable
 from .config import get_default_config
 from .vocabulary import Vocabulary
 from .valid_mask import ValidMaskComputer
-from .policy import TransformerPolicy
+# from .policy import TransformerPolicy
+from .policy import GNNTransformerPolicy  
 from .program import Program
 from .gp_controller import NDGPController
 from .risk_seeking import RiskSeekingSelector
@@ -23,6 +24,8 @@ from .policy_optimizer import DSOOptimizer
 from ND2.GDExpr import GDExprClass, GDExpr
 from ND2.utils import AttrDict, seed_all
 import torch
+import torch.nn.functional as F
+torch.cuda.set_device(2)
 from tqdm import tqdm
 from ND2.search.reward_solver import RewardSolver
  
@@ -35,25 +38,15 @@ signal.signal(signal.SIGTERM, _signal_handler)
  
  
 class NewDSOTrainer:
-    """
-    new_DSO 完整训练器，整合第零步到第八步。
- 
-    第八步职责:
-    1. 每次迭代后更新全局最优
-    2. 日志记录统计数据
-    3. 早停判断（任务成功 / 采样数耗尽 / 时间到）
-    4. 定期保存 checkpoint
-    5. 训练结束后输出最终结果
-    """
     def __init__(self,
                  config=None,
                  gdexpr_config=None,
                  Xv=None, Xe=None, A=None, G=None, Y=None, mask=None):
-        
-        available_vars = list(Xv.keys()) if Xv else []  # 如 ['v1', 'v2']
+ 
+        available_vars = list(Xv.keys()) if Xv else []
         if Xe:
-            available_vars += list(Xe.keys())  # 如 ['e1']
-        
+            available_vars += list(Xe.keys())
+ 
         # ======== 第零步：初始化 ========
         self.config = config or get_default_config()
         seed_all(self.config.training.seed)
@@ -61,23 +54,33 @@ class NewDSOTrainer:
         self.vocab = Vocabulary(self.config)
         self.valid_mask_computer = ValidMaskComputer(self.vocab, self.config)
  
-        self.policy = TransformerPolicy(self.vocab, self.config)
+        # ★ 策略网络：GNN Encoder (512d) + 投影层 (512→128) + Transformer Decoder (128d)
+        self.policy = GNNTransformerPolicy(self.vocab, self.config)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.policy.to(self.device)
+ 
+        # ★ 从 NDformer checkpoint 加载 GNN + encoder Transformer 权重（冻结）
+        ndformer_path = './weights/checkpoint.pth'
+        if os.path.exists(ndformer_path):
+            self.policy.load_from_ndformer(ndformer_path, device=self.device)
+            logger.info(f"[new_DSO] NDformer 编码器权重已加载: {ndformer_path}")
+        else:
+            logger.warning(f"[new_DSO] NDformer 权重不存在: {ndformer_path}，"
+                           f"GNN 编码器将使用随机初始化（效果会很差）")
+            
+        self.root_type = getattr(self.config.data, 'root_type', 'node')
 
-        # ★ 加载预训练权重
+        # ★ 预训练 graph_proj
+        if os.path.exists(ndformer_path) and Y is not None:
+            self._pretrain_graph_proj(Xv, Xe, A, G, Y, self.root_type, mask, n_steps=200)
+
+        # ★ 可选：加载旧版 new_DSO 预训练权重（解码器部分，strict=False 跳过不匹配的 key）
         pretrain_path = './weights/new_dso_pretrained.pth'
         if os.path.exists(pretrain_path):
             ckpt = torch.load(pretrain_path, map_location=self.device, weights_only=True)
-            self.policy.load_state_dict(ckpt['policy'])
-            logger.info(f"[new_DSO] 加载预训练权重: {pretrain_path} (epoch={ckpt.get('epoch','?')}, loss={ckpt.get('loss','?'):.4f})")
-        else:
-            logger.warning(f"[new_DSO] 预训练权重不存在: {pretrain_path}，使用随机初始化")
+            self.policy.load_state_dict(ckpt['policy'], strict=False)
+            logger.info(f"[new_DSO] 旧预训练权重已加载（解码器部分）: {pretrain_path}")
  
-        self.policy.eval()
-        for param in self.policy.parameters():
-            param.requires_grad = False
-        logger.info("[new_DSO] 策略网络已冻结，搜索过程中不更新参数")
         self.gdexpr = GDExprClass(self.config)
  
         # 数据
@@ -87,14 +90,16 @@ class NewDSOTrainer:
         self.G = G
         self.Y = Y
         self.mask = mask
-
-        self.ndformer = NDformer(device=self.device)
-        self.ndformer.load('./weights/checkpoint.pth', weights_only=False)
-        self.ndformer.eval()
-        self.ndformer.set_data(
-            Xv=Xv, Xe=Xe, A=A, G=G, Y=Y,
-            root_type='node', cache_data_emb=True
-        )       
+ 
+        # ★ 预计算 graph_emb（二值化管线 → GNN + Transformer Encoder，只算一次）
+        # self.root_type = getattr(self.config.data, 'root_type', 'node')
+        self.graph_emb = None
+        if Y is not None and A is not None and G is not None:
+            self.graph_emb = self._encode_data(Xv, Xe, A, G, Y, self.root_type, mask)
+            logger.info(f"[new_DSO] graph_emb shape: {self.graph_emb.shape}")
+ 
+        # ★ 不再需要单独的 NDformer 实例，GNN 已在 policy 内部
+        # （删掉原来的 self.ndformer = NDformer(...) 等代码）
  
         # 奖励计算器（第三步）
         if Y is not None and A is not None and G is not None:
@@ -134,7 +139,7 @@ class NewDSOTrainer:
             combined_alpha=0.7,
         )
  
-        # 策略优化器（第七步）
+        # 策略优化器（第七步）—— ★ 只优化 requires_grad=True 的参数
         self.optimizer = DSOOptimizer(
             policy=self.policy,
             vocab=self.vocab,
@@ -147,6 +152,8 @@ class NewDSOTrainer:
             pqt_max_size=50,
             pqt_mix_ratio=0.2,
         )
+        # ★ 注入预计算的 graph_emb
+        self.optimizer.set_graph_emb(self.graph_emb)
  
         # ======== 第八步状态 ========
         self.n_evals = 0
@@ -156,38 +163,212 @@ class NewDSOTrainer:
         self.best_prefix_with_coef = None
         self.start_time = None
         self.step_count = 0
-        self.history = []  # 每步的摘要记录
-
+        self.history = []
+ 
         self._last_probs = None
         self._last_actions = None
         self._last_masks = None
-        self._prob_vis_interval = 50   # 每 50 步可视化一次
+        self._prob_vis_interval = 50
  
         Program.clear_cache()
         Program.clear_reward_cache()
-        logger.info("[new_DSO] 初始化完成（第零步~第八步就绪）")
-
+ 
+        # 带 available_vars 的 mask computer（覆盖上面的）
         self.valid_mask_computer = ValidMaskComputer(
             self.vocab, self.config, available_vars=available_vars
         )
  
-    # ============================================================
-    # 第一步+第二步：采样 + 补全
-    # ============================================================
+        # 日志
+        trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
+        trainable_names = [n for n, p in self.policy.named_parameters() if p.requires_grad]
+        frozen_params = [p for p in self.policy.parameters() if not p.requires_grad]
+        logger.info(f"[new_DSO] 总参数: {sum(p.numel() for p in self.policy.parameters()):,}")
+        logger.info(f"[new_DSO] 可训练参数: {sum(p.numel() for p in trainable_params):,}")
+        logger.info(f"[new_DSO] 冻结参数: {sum(p.numel() for p in frozen_params):,}")
+        logger.info(f"[new_DSO] 可训练模块: {set(n.split('.')[0] for n in trainable_names)}")
+        logger.info(f"[new_DSO] 初始化完成（第零步~第八步就绪）")
+ 
+    def _pretrain_graph_proj(self, Xv, Xe, A, G, Y, root_type, mask=None, n_steps=200):
+        """
+        预训练 graph_proj：用合成数据教投影层把 512d GNN 输出对齐到 128d 解码器空间。
+ 
+        思路：用 NDformer 的解码器做"老师"，graph_proj 的输出要接近 NDformer 
+        编码器的 512d 输出经过 NDformer 自己解码器能正确预测 token 的效果。
+        简化方案：直接用 MSE 让 graph_proj(GNN_512d) ≈ GNN_512d[:, :128] 的 
+        线性投影，但更好的方式是：
+ 
+        实际方案：用 ND2 合成数据生成 (var_dict, prefix) 对，让解码器通过 
+        graph_proj 输出的 graph_emb 预测下一个 token，做 MLE 预训练。
+        """
+        from ND2.GDExpr import GDExpr
+        from ND2.dataset.generator import Generator
+ 
+        logger.info(f"[pretrain_proj] 开始预训练 graph_proj，{n_steps} 步")
+ 
+        # 冻结编码器，只训练 graph_proj + 解码器
+        self.policy.freeze_encoder()
+        for param in self.policy.graph_proj.parameters():
+            param.requires_grad = True
+        for param in self.policy.decoder.parameters():
+            param.requires_grad = True
+        for param in self.policy.token_embedding.parameters():
+            param.requires_grad = True
+        for param in self.policy.ln_f.parameters():
+            param.requires_grad = True
+        for param in self.policy.output_head.parameters():
+            param.requires_grad = True
+ 
+        trainable = [p for p in self.policy.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(trainable, lr=1e-3)
+        generator = Generator()
+ 
+        # 硬编码一些合成方程（与 pretrain.py 相同）
+        equations = [
+            (['add', 'v1', 'mul', '<C>', 'aggr', 'sin', 'sub', 'sour', 'v2', 'targ', 'v2'], 'node'),
+            (['sub', 'sub', 'sub', 'mul', 'v2', 'pow3', 'v2', 'v1',
+              'div', 'mul', '<C>', 'aggr', 'sub', 'sour', 'v2', 'targ', 'v2', 'aggr', '<C>'], 'node'),
+            (['sub', 'add', '<C>', 'mul', '<C>', 'v2', 'mul', '<C>', 'v1'], 'node'),
+            (['add', 'neg', 'v2', 'aggr', 'sour', 'regular', 'v2', '<C>'], 'node'),
+            (['add', 'neg', 'v2', 'aggr', 'sour', 'sigmoid', 'mul', '<C>', 'sub', 'v2', '<C>'], 'node'),
+            (['add', 'mul', 'neg', 'v3', 'v2',
+              'aggr', 'mul', 'sub', '<C>', 'targ', 'v2', 'sour', 'v2'], 'node'),
+        ]
+ 
+        self.policy.train()
+        for step in range(n_steps):
+            # 随机选一个方程
+            prefix, rt = equations[np.random.randint(len(equations))]
+ 
+            # 生成合成数据
+            try:
+                var_dict = generator.generate_data(prefix, rt)
+            except Exception:
+                continue
+ 
+            # 编码图数据
+            A_arr = var_dict['A']
+            G_arr = var_dict['G']
+            out_arr = var_dict['out']
+            N_gen, V_gen, E_gen = out_arr.shape[0], A_arr.shape[0], G_arr.shape[0]
+ 
+            v = [out_arr if rt == 'node' else np.zeros((N_gen, V_gen))] + \
+                [var_dict.get(var, np.zeros((N_gen, V_gen))) for var in GDExpr.variable.node]
+            v = np.stack(v, axis=-1)
+            e = [out_arr if rt == 'edge' else np.zeros((N_gen, E_gen))] + \
+                [var_dict.get(var, np.zeros((N_gen, E_gen))) for var in GDExpr.variable.edge]
+            e = np.stack(e, axis=-1)
+ 
+            v_bits = torch.from_numpy(GDExpr.parse_float(v)).to(self.device, torch.float32)
+            e_bits = torch.from_numpy(GDExpr.parse_float(e)).to(self.device, torch.float32)
+            G_t = torch.from_numpy(G_arr).to(self.device, torch.long)
+            A_t = torch.from_numpy(A_arr).to(self.device, torch.long)
+ 
+            graph_emb = self.policy.encode_graph(v_bits, e_bits, G_t, A_t, rt)  # (N_s, 128)
+            graph_emb = graph_emb.unsqueeze(0)  # (1, N_s, 128)
+ 
+            # 构造 prefix token ids
+            token_ids = [self.vocab.sos_id]
+            for tok in prefix:
+                mapped = {'term': 'targ'}.get(tok, tok)
+                if mapped in self.vocab.word2id:
+                    token_ids.append(self.vocab.word2id[mapped])
+            token_ids.append(self.vocab.eos_id)
+ 
+            if len(token_ids) < 3:
+                continue
+ 
+            prefix_t = torch.tensor([token_ids], dtype=torch.long, device=self.device)
+ 
+            # 前向
+            logits = self.policy.forward_full(prefix_t, graph_emb=graph_emb)  # (1, L, n_actions)
+ 
+            # teacher forcing：每个位置预测下一个 token
+            targets = prefix_t[:, 1:]  # (1, L-1)
+            pred = logits[:, :-1, :]   # (1, L-1, n_actions)
+ 
+            loss = F.cross_entropy(pred.reshape(-1, pred.size(-1)),
+                                   targets.reshape(-1),
+                                   ignore_index=self.vocab.pad_id)
+ 
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            optimizer.step()
+ 
+            if (step + 1) % 50 == 0:
+                logger.info(f"[pretrain_proj] step {step+1}/{n_steps} loss={loss.item():.4f}")
+ 
+        # 预训练完毕，重新冻结编码器
+        if self.config.encoder.freeze:
+            self.policy.freeze_encoder()
+ 
+        logger.info(f"[pretrain_proj] 完成")
+    
+    # -------------------------------------------------------
+    # ★ 图数据编码（与 core.py 中逻辑相同）
+    # -------------------------------------------------------
+    def _encode_data(self, Xv, Xe, A, G, Y, root_type, mask=None):
+        self.policy.eval()
+        with torch.no_grad():
+            V, E, T = A.shape[0], G.shape[0], Y.shape[0]
+    
+            # 构建 var_dict（与之前一样）
+            var_dict = dict(A=A, G=G, out=Y)
+            for idx, (k, v) in enumerate(Xv.items(), 1):
+                if v.ndim == 1: v = v.reshape(1, -1).repeat(T, axis=0)
+                if v.shape[-1] == 1: v = v.repeat(V, axis=-1)
+                var_dict[f'v{idx}'] = v
+            for idx, (k, e) in enumerate(Xe.items(), 1):
+                if e.ndim == 1: e = e.reshape(1, -1).repeat(T, axis=0)
+                if e.shape[-1] == 1: e = e.repeat(E, axis=-1)
+                var_dict[f'e{idx}'] = e
+    
+            out = var_dict['out']
+            N = out.shape[0]
+            v = [out if root_type == 'node' else np.zeros((N, V))] + \
+                [var_dict.get(var, np.zeros((N, V))) for var in GDExpr.variable.node]
+            v = np.stack(v, axis=-1)  # (N, V, 1+d_v)
+            e = [out if root_type == 'edge' else np.zeros((N, E))] + \
+                [var_dict.get(var, np.zeros((N, E))) for var in GDExpr.variable.edge]
+            e = np.stack(e, axis=-1)  # (N, E, 1+d_e)
+    
+            # ★ 第一阶段：在时间维度上预采样（与 NDformer.encode 一致）
+            ec = self.config.encoder
+            VorE = (V if root_type == 'node' else E)
+            n = int(np.ceil(3 * ec.max_sample_num / VorE))
+            if n < N:
+                sample_idx = np.random.choice(N, n, replace=False)
+                v = v[sample_idx]
+                e = e[sample_idx]
+                N = n
+                if mask is not None:
+                    mask = mask[sample_idx]
+                logger.info(f"[_encode_data] 时间步采样: {T} → {n}")
+    
+            # 第二阶段：二值化 → GNN → 展平截断（encode_graph 内部）
+            v_bits = torch.from_numpy(GDExpr.parse_float(v)).to(self.device, torch.float32)
+            e_bits = torch.from_numpy(GDExpr.parse_float(e)).to(self.device, torch.float32)
+            G_t = torch.from_numpy(G).to(self.device, torch.long)
+            A_t = torch.from_numpy(A).to(self.device, torch.long)
+    
+            graph_emb = self.policy.encode_graph(v_bits, e_bits, G_t, A_t, root_type, mask=mask)
+            graph_emb = graph_emb.unsqueeze(0)
+    
+        return graph_emb
+ 
+    # -------------------------------------------------------
+    # 第一步+第二步：采样 + 补全（★ 传入 graph_emb）
+    # -------------------------------------------------------
     def sample_batch(self, batch_size=None):
         batch_size = batch_size or self.config.training.batch_size
         actions, log_probs, entropies, finished, masks, probs = \
             self.policy.sample(
                 batch_size=batch_size,
                 valid_mask_computer=self.valid_mask_computer,
-                device=self.device
-                # prior_bias=self._get_prior_bias()
+                device=self.device,
+                graph_emb=self.graph_emb,    # ← 关键！
             )
-
-        self._last_probs = probs        # (B, L, n_actions)
-        self._last_actions = actions    # (B, L)
-        self._last_masks = masks        # (B, L)
-
+        # 后续 Program 构建逻辑不变……
         programs = []
         for i in range(batch_size):
             valid_mask_i = masks[i]
@@ -196,21 +377,10 @@ class NewDSOTrainer:
             if cache_key in Program._cache:
                 programs.append(Program._cache[cache_key])
             else:
-                prog = Program(
-                    token_ids=token_ids, vocab=self.vocab,
-                    config=self.config, gdexpr=self.gdexpr,
-                    reward_solver=self.reward_solver,
-                )
-                Program._cache[cache_key] = prog
+                prog = Program(token_ids=token_ids, vocab=self.vocab, 
+                                config=self.config, gdexpr=self.gdexpr, 
+                                reward_solver=self.reward_solver)
                 programs.append(prog)
-        self.n_evals += batch_size
-        if self.step_count % 10 == 0:
-            for i, p in enumerate(programs[:5]):  # 只打印前20个
-                try:
-                    expr_str = GDExpr.prefix2str(p.prefix)
-                except:
-                    expr_str = ' '.join(p.prefix)
-                logger.info(f"[Sample] {i}: {expr_str} | terminal={p.is_terminal()}")
         return programs
  
     # ============================================================
@@ -475,7 +645,6 @@ class NewDSOTrainer:
             f"ε={tc.epsilon} | n_samples={tc.n_samples} | "
             f"device={self.device}"
         )
-        self.policy.eval()
  
         try:
             total_evals = 0   
@@ -483,6 +652,7 @@ class NewDSOTrainer:
                 step_start = time.time()
  
                 # ---- 第一步+第二步: 采样 + 补全 ----
+                self.policy.eval()
                 programs = self.sample_batch()
  
                 # ---- 第三步: 计算奖励 ----
@@ -523,10 +693,11 @@ class NewDSOTrainer:
  
                 # ---- 第七步: 策略梯度更新 ----
                 # n_updates = max(5, len(elite_programs) // 4)  # 至少5次
+                self.policy.train()
                 n_updates = 3  # 固定更新次数，避免过拟合
                 stats = {}
                 for u in range(n_updates):
-                    # stats = self.policy_update(elite_programs, elite_rewards, baseline)
+                    stats = self.policy_update(elite_programs, elite_rewards, baseline)
                     if not stats or stats.get('total_loss', 1) == 0:
                         break
  

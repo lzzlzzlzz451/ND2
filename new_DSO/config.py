@@ -35,11 +35,11 @@ def get_default_config():
             }),
         }),
  
-        # ---- RNN 策略网络 ----
+        # ---- 策略网络 (GNN Encoder + Transformer Decoder) ----
         'policy': AttrDict({
-            'd_model': 128,            # Transformer 隐层维度（原 hidden_size=64）
+            'd_model': 128,            # 隐层维度
             'nhead': 4,                # 注意力头数
-            'num_layers': 3,           # Transformer 层数（原 RNN 2层）
+            'num_layers': 3,           # Transformer Decoder 层数
             'dim_feedforward': 256,    # FFN 中间层维度
             'dropout': 0.1,           # Dropout
             'max_length': 30,         # 表达式最大 token 数
@@ -48,16 +48,27 @@ def get_default_config():
             'max_edge_coeff_num': 3,
         }),
  
+        # ---- ★ GNN 编码器配置（新增）----
+        'encoder': AttrDict({
+            'd_data_feat': 16,          # 浮点二值化位宽：1符号 + 5指数 + 10尾数
+            'n_node_vars': 6,           # 最大节点变量数
+            'n_edge_vars': 6,           # 最大边变量数
+            'n_GNN_layers': 2,          # GNN 层数
+            'n_transformer_layers': 2,  # 编码端 Transformer 层数
+            'max_sample_num': 3000,     # 编码端最大采样节点/边数
+            'split': False,             # 是否逐样本拆分 GNN
+            'freeze': True,             # ★ RL 训练时冻结 GNN 编码器
+        }),
+ 
         # ---- 训练 ----
         'training': AttrDict({
-            'batch_size': 256,
+            'batch_size': 512,
             'n_samples': 100000,
-            'epsilon': 0.05,           # 风险寻求：只保留 top-5%
             'entropy_weight': 0.01,
             'baseline_mode': 'R_e',    # 'R_e', 'ewma_R', 'ewma_R_e', 'combined'
             'learning_rate': 1e-3,
             'seed': 42,
-            'epsilon': 0.05,              # 风险寻求：top-5% 精英
+            'epsilon': 0.3,              # 风险寻求：top-5% 精英
             'use_memory_queue': True,     # 启用历史队列稳定分位数
             'memory_queue_size': 10,      # 历史队列长度
             'memory_decay': 0.9,          # 历史衰减系数
@@ -70,16 +81,16 @@ def get_default_config():
             'sample_num': 500,         # BFGS 采样点数
             'complexity_base': 0.999,
         }),
-
+ 
         # ---- GP-Meld 遗传规划（第四步新增）----
         'gp': AttrDict({
             'enabled': True,
-            'population_size': 50,     # GP 种群大小
+            'population_size': 512,     # GP 种群大小
             'crossover_rate': 0.7,     # 交叉概率
             'mutation_rate': 0.3,      # 变异概率
             'tournament_size': 5,      # 锦标赛选择大小
-            'max_offspring': 50,       # 每轮最大后代数
-            'elite_fraction': 0.1,     # 精英保留比例
+            'max_offspring': 512,       # 每轮最大后代数
+            'elite_fraction': 0.3,     # 精英保留比例
         }),
     })
     return config
